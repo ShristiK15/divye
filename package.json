@@ -1,0 +1,20 @@
+{
+  "name": "divye-electronics",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:frontend": "npm run dev --workspace=@divye/frontend",
+    "build:frontend": "npm run build --workspace=@divye/frontend",
+    "dev:backend": "npm run dev --workspace=@divye/backend",
+    "build:backend": "npm run build --workspace=@divye/backend",
+    "db:generate": "npm run generate --workspace=@divye/database",
+    "db:push": "npm run push --workspace=@divye/database",
+    "db:migrate": "npm run migrate --workspace=@divye/database"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
