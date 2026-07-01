@@ -24,6 +24,7 @@ function mapListItem(product: {
   id: string;
   name: string;
   brand: string;
+  isActive: boolean;  
   isFeatured: boolean;
   category: { id: string; name: string; slug: string };
   images: Array<{ url: string; isPrimary: boolean }>;
