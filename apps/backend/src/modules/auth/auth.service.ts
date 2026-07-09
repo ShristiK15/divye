@@ -20,9 +20,6 @@ const BCRYPT_ROUNDS = 12;
 const EMAIL_TOKEN_EXPIRY_HOURS = 24;
 const OTP_EXPIRY_MINUTES = 15;
 
-const emailVerificationStore = new Map<string, { userId: string; expiresAt: Date }>();
-const passwordResetStore = new Map<string, { otp: string; expiresAt: Date }>();
-
 function generateRefreshTokenValue(): string {
   return crypto.randomBytes(64).toString('hex');
 }
@@ -79,7 +76,9 @@ export const authService = {
     const emailToken = generateEmailToken();
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + EMAIL_TOKEN_EXPIRY_HOURS);
-    emailVerificationStore.set(emailToken, { userId: user.id, expiresAt });
+    await prisma.emailVerificationToken.create({
+      data: { token: emailToken, userId: user.id, expiresAt },
+    });
 
     notificationService.sendEmailVerification(user, emailToken).catch((err: unknown) => {
       // fire-and-forget
@@ -145,20 +144,28 @@ export const authService = {
   },
 
   async verifyEmail(dto: VerifyEmailDto): Promise<SafeUser> {
-    const record = emailVerificationStore.get(dto.token);
+    const record = await prisma.emailVerificationToken.findUnique({
+      where: { token: dto.token },
+    });
 
     if (!record || record.expiresAt < new Date()) {
-      emailVerificationStore.delete(dto.token);
+      if (record) {
+        await prisma.emailVerificationToken.delete({ where: { id: record.id } });
+      }
       throw new AppError('Invalid or expired verification token', 400, ErrorCodes.BAD_REQUEST);
     }
 
-    const user = await prisma.user.update({
-      where: { id: record.userId },
-      data: { isEmailVerified: true },
-      select: USER_SELECT,
+    const user = await prisma.$transaction(async (tx) => {
+      const updatedUser = await tx.user.update({
+        where: { id: record.userId },
+        data: { isEmailVerified: true },
+        select: USER_SELECT,
+      });
+
+      await tx.emailVerificationToken.delete({ where: { id: record.id } });
+      return updatedUser;
     });
 
-    emailVerificationStore.delete(dto.token);
     return user;
   },
 
@@ -175,13 +182,20 @@ export const authService = {
     const otp = generateOtp();
     const expiresAt = new Date();
     expiresAt.setMinutes(expiresAt.getMinutes() + OTP_EXPIRY_MINUTES);
-    passwordResetStore.set(dto.email, { otp, expiresAt });
+
+    await prisma.passwordResetOtp.upsert({
+      where: { email: dto.email },
+      create: { email: dto.email, otp, expiresAt },
+      update: { otp, expiresAt },
+    });
 
     notificationService.sendPasswordReset(user, otp).catch(() => {});
   },
 
   async resetPassword(dto: ResetPasswordDto): Promise<void> {
-    const record = passwordResetStore.get(dto.email);
+    const record = await prisma.passwordResetOtp.findUnique({
+      where: { email: dto.email },
+    });
 
     if (!record || record.expiresAt < new Date() || record.otp !== dto.otp) {
       throw new AppError('Invalid or expired OTP', 400, ErrorCodes.BAD_REQUEST);
@@ -194,9 +208,12 @@ export const authService = {
       data: { passwordHash },
     });
 
-    passwordResetStore.delete(dto.email);
     await prisma.refreshToken.deleteMany({
       where: { user: { email: dto.email } },
+    });
+
+    await prisma.passwordResetOtp.delete({
+      where: { id: record.id },
     });
   },
 

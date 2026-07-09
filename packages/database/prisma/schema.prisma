@@ -64,6 +64,7 @@ model User {
   wishlistItems WishlistItem[]
   reviews       Review[]
   refreshTokens RefreshToken[]
+  emailVerificationTokens EmailVerificationToken[]
   cart          Cart?
 
   @@index([email])
@@ -78,6 +79,29 @@ model RefreshToken {
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model PasswordResetOtp {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  otp       String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
 }
 
 model Address {
