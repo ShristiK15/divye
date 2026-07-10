@@ -4,12 +4,13 @@ import { categoriesService } from './categories.service';
 import type { CreateCategoryDto, UpdateCategoryDto } from './categories.types';
 
 export const getTree = async (
-  _req: Request,
+  req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await categoriesService.getTree();
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await categoriesService.getTree(isAdmin);
     res.status(200).json(successResponse(result, 'Categories retrieved'));
   } catch (error) {
     next(error);
@@ -22,7 +23,8 @@ export const getBySlug = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await categoriesService.getBySlug(req.params.slug);
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await categoriesService.getBySlug(req.params.slug, isAdmin);
     res.status(200).json(successResponse(result, 'Category retrieved'));
   } catch (error) {
     next(error);
@@ -61,8 +63,8 @@ export const deactivate = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    await categoriesService.deactivate(req.params.id);
-    res.status(200).json(successResponse(null, 'Category deactivated'));
+    const result = await categoriesService.deactivate(req.params.id);
+    res.status(200).json(successResponse(result, 'Category deactivated'));
   } catch (error) {
     next(error);
   }

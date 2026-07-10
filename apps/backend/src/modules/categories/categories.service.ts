@@ -29,23 +29,41 @@ function buildTree(
     }));
 }
 
+async function collectDescendantIds(rootId: string): Promise<Set<string>> {
+  const all = await prisma.category.findMany({ select: { id: true, parentId: true } });
+  const descendants = new Set<string>();
+  const stack = [rootId];
+
+  while (stack.length) {
+    const current = stack.pop()!;
+    for (const c of all) {
+      if (c.parentId === current && !descendants.has(c.id)) {
+        descendants.add(c.id);
+        stack.push(c.id);
+      }
+    }
+  }
+
+  return descendants;
+}
+
 export const categoriesService = {
-  async getTree(): Promise<CategoryTreeNode[]> {
+  async getTree(isAdmin: boolean = false): Promise<CategoryTreeNode[]> {
     // TODO: cache this response
     const categories = await prisma.category.findMany({
-      where: { isActive: true },
+      where: isAdmin ? {} : { isActive: true },
       orderBy: { sortOrder: 'asc' },
     });
 
     return buildTree(categories);
   },
 
-  async getBySlug(slug: string): Promise<CategoryTreeNode> {
+  async getBySlug(slug: string, isAdmin: boolean=false): Promise<CategoryTreeNode> {
     const category = await prisma.category.findUnique({
       where: { slug },
       include: {
         children: {
-          where: { isActive: true },
+          where: isAdmin ? {} : { isActive: true },
           orderBy: { sortOrder: 'asc' },
         },
       },
@@ -102,6 +120,22 @@ export const categoriesService = {
       throw new AppError('Category not found', 404, ErrorCodes.NOT_FOUND);
     }
 
+    if (dto.parentId && dto.parentId !== existing.parentId) {
+      if (dto.parentId === id) {
+        throw new AppError('A category cannot be its own parent', 400, ErrorCodes.VALIDATION_ERROR);
+      }
+
+      const parent = await prisma.category.findUnique({ where: { id: dto.parentId } });
+      if (!parent) {
+        throw new AppError('Parent category not found', 404, ErrorCodes.NOT_FOUND);
+      }
+
+      const descendantIds = await collectDescendantIds(id);
+      if (descendantIds.has(dto.parentId)) {
+        throw new AppError('Cannot set a descendant category as the parent', 400, ErrorCodes.VALIDATION_ERROR);
+      }
+    }
+
     let slug = dto.slug;
     if (dto.slug && dto.slug !== existing.slug) {
       slug = await ensureUniqueSlug(dto.slug, async (s) => {
@@ -121,15 +155,20 @@ export const categoriesService = {
     return { ...category, children: [] };
   },
 
-  async deactivate(id: string): Promise<void> {
+  async deactivate(id: string): Promise<{ deactivatedIds: string[] }> {
     const existing = await prisma.category.findUnique({ where: { id } });
     if (!existing) {
       throw new AppError('Category not found', 404, ErrorCodes.NOT_FOUND);
     }
-
-    await prisma.category.update({
-      where: { id },
+  
+    const descendantIds = await collectDescendantIds(id);
+    const idsToDeactivate = [id, ...descendantIds];
+  
+    await prisma.category.updateMany({
+      where: { id: { in: idsToDeactivate } },
       data: { isActive: false },
     });
+  
+    return { deactivatedIds: idsToDeactivate };
   },
 };
