@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 const variantSchema = z.object({
+  id: z.string().cuid().optional(),
   sku: z.string().min(1),
   name: z.string().min(1),
   price: z.coerce.number().positive(),

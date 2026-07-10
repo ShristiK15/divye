@@ -65,7 +65,7 @@ function mapListItem(product: {
 }
 
 export const productsService = {
-  async list(query: ProductListQuery) {
+  async list(query: ProductListQuery, isAdmin = false) {
     const { page, limit, search, categoryId, category, brand, minPrice, maxPrice, inStock, isActive, isFeatured, sort } = query;
     const skip = (page - 1) * limit;
 
@@ -78,8 +78,11 @@ export const productsService = {
       resolvedCategoryId = categoryRecord?.id;
     }
 
+    // Only an authenticated admin can request inactive products via isActive=false
+    const effectiveIsActive = isAdmin ? isActive : true;
+
     const where: Prisma.ProductWhereInput = {
-      ...(isActive !== undefined ? { isActive } : { isActive: true }),
+      ...(effectiveIsActive !== undefined ? { isActive: effectiveIsActive } : {}),
       ...(resolvedCategoryId && { categoryId: resolvedCategoryId }),
       ...(brand && { brand: { equals: brand, mode: 'insensitive' } }),
       ...(isFeatured !== undefined && { isFeatured }),
@@ -98,6 +101,8 @@ export const productsService = {
           isActive: true,
           ...(minPrice !== undefined && { price: { gte: minPrice } }),
           ...(maxPrice !== undefined && { price: { lte: maxPrice } }),
+          ...(inStock === true && { stockQty: { gt: 0 } }),
+          ...(inStock === false && { stockQty: { lte: 0 } }),
         },
       };
     }
@@ -122,14 +127,7 @@ export const productsService = {
       prisma.product.count({ where }),
     ]);
 
-    let items = products.map(mapListItem);
-
-    if (inStock !== undefined) {
-      items = items.filter((p) => {
-        const availableQty = p.variant ? p.variant.stockQty : 0;
-        return (availableQty > 0) === inStock;
-      });
-    }
+    const items = products.map(mapListItem);
 
     if (sort === 'price_asc') {
       items.sort((a, b) => parseFloat(a.variant?.price ?? '0') - parseFloat(b.variant?.price ?? '0'));
@@ -142,40 +140,45 @@ export const productsService = {
       meta: buildPaginationMeta(total, page, limit),
     };
   },
+  async getByIdentifier(identifier: string, isAdmin = false) {
+    const include = {
+      ...productInclude,
+      variants: {
+        where: isAdmin ? {} : { isActive: true },
+        orderBy: { createdAt: 'asc' as const },
+      },
+    };
 
-  async getByIdentifier(identifier: string) {
-    const product = await prisma.product.findUnique({
-      where: { id: identifier },
-      include: productInclude,
-    });
-
+    const product = await prisma.product.findUnique({ where: { id: identifier }, include });
     if (product) {
-      return product;
+      if (!isAdmin && !product.isActive) {
+        throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
+      }
+      return product; 
     }
 
     const slugProduct = await prisma.product.findFirst({
-      where: { isActive: true, seo: { slug: identifier } },
-      include: productInclude,
+      where: { seo: { slug: identifier }, ...(isAdmin ? {} : { isActive: true }) },
+      include,
     });
 
     if (!slugProduct) {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
-
     return slugProduct;
   },
 
-  async getBySlug(slug: string) {
-    return this.getByIdentifier(slug);
+  async getBySlug(slug: string, isAdmin = false) {
+    return this.getByIdentifier(slug, isAdmin);
   },
 
-  async getByCategorySlug(slug: string, query: ProductListQuery) {
+  async getByCategorySlug(slug: string, query: ProductListQuery, isAdmin = false) {
     const category = await prisma.category.findUnique({ where: { slug } });
     if (!category || !category.isActive) {
       throw new AppError('Category not found', 404, ErrorCodes.NOT_FOUND);
     }
-
-    return this.list({ ...query, category: slug });
+  
+    return this.list({ ...query, category: slug }, isAdmin);
   },
 
   async listBrands() {
@@ -273,25 +276,54 @@ export const productsService = {
       });
 
       if (dto.variants !== undefined) {
-        await tx.productVariant.deleteMany({ where: { productId: updatedProduct.id } });
-        if (dto.variants.length > 0) {
-          await tx.productVariant.createMany({
-            data: dto.variants.map((v) => ({
-              productId: updatedProduct.id,
-              sku: v.sku,
-              name: v.name,
-              price: toDecimal(v.price),
-              mrp: toDecimal(v.mrp),
-              gstPercent: toDecimal(v.gstPercent),
-              hsnCode: v.hsnCode,
-              stockQty: v.stockQty,
-              lowStockThreshold: v.lowStockThreshold,
-              supplierId: v.supplierId,
-              attributes: v.attributes,
-            })),
-          });
-        }
-      }
+        const incomingIds = dto.variants
+          .map((v) => v.id)
+          .filter((id): id is string => Boolean(id));
+      
+        // Delete variants that were removed from the payload (not present by id)
+        await tx.productVariant.deleteMany({
+          where: {
+            productId: updatedProduct.id,
+            id: { notIn: incomingIds },
+          },
+        });
+      
+        for (const v of dto.variants) {
+          const data = {
+            sku: v.sku,
+            name: v.name,
+            price: toDecimal(v.price),
+            mrp: toDecimal(v.mrp),
+            gstPercent: toDecimal(v.gstPercent),
+            hsnCode: v.hsnCode,
+            stockQty: v.stockQty,
+            lowStockThreshold: v.lowStockThreshold,
+            supplierId: v.supplierId,
+            attributes: v.attributes,
+          };
+        
+          if (v.id) {
+            // Scope the update to this product so one product's payload can't
+            // silently touch another product's variant by guessing/reusing an id
+            const result = await tx.productVariant.updateMany({
+              where: { id: v.id, productId: updatedProduct.id },
+              data,
+            });
+          
+            if (result.count === 0) {
+              throw new AppError(
+                `Variant ${v.id} not found for this product`,
+                404,
+                ErrorCodes.NOT_FOUND
+              );
+            }
+    } else {
+      await tx.productVariant.create({
+        data: { ...data, productId: updatedProduct.id },
+      });
+    }
+  }
+}
 
       if (dto.specifications !== undefined) {
         await tx.productSpec.deleteMany({ where: { productId: updatedProduct.id } });
@@ -358,7 +390,7 @@ export const productsService = {
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      const result = await new Promise<{ secure_url: string }>((resolve, reject) => {
+      const result = await new Promise<{ secure_url: string; public_id: string }>((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
           { folder: 'divye/products', resource_type: 'image' },
           (error, uploadResult) => {
@@ -373,6 +405,7 @@ export const productsService = {
         data: {
           productId,
           url: result.secure_url,
+          publicId: result.public_id,
           altText: product.name,
           sortOrder: existingCount + i,
           isPrimary: existingCount === 0 && i === 0,
@@ -388,11 +421,22 @@ export const productsService = {
     const image = await prisma.productImage.findFirst({
       where: { id: imageId, productId },
     });
-
+  
     if (!image) {
       throw new AppError('Image not found', 404, ErrorCodes.NOT_FOUND);
     }
-
+  
+    // Delete the DB row first — if this fails, we haven't destroyed anything real yet.
+    // If Cloudinary delete fails after, we're left with an orphaned remote asset
+    // instead of a broken image reference the storefront would actually render — the safer failure direction.
     await prisma.productImage.delete({ where: { id: imageId } });
+  
+    try {
+      await cloudinary.uploader.destroy(image.publicId, { resource_type: 'image' });
+    } catch (error) {
+      // Log and swallow — don't fail the request over a Cloudinary-side cleanup issue.
+      // Worth wiring to a proper logger/alerting so orphaned assets don't pile up silently.
+      console.error(`Failed to delete Cloudinary asset ${image.publicId} for image ${imageId}:`, error);
+    }
   },
 };

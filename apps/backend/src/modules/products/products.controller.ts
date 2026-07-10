@@ -3,13 +3,10 @@ import { paginatedResponse, successResponse } from '../../utils/response';
 import { productsService } from './products.service';
 import type { CreateProductDto, ProductListQuery, UpdateProductDto } from './products.types';
 
-export const list = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const list = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const result = await productsService.list(req.query as unknown as ProductListQuery);
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await productsService.list(req.query as unknown as ProductListQuery, isAdmin);
     res.status(200).json(paginatedResponse(result.items, result.meta));
   } catch (error) {
     next(error);
@@ -35,7 +32,8 @@ export const getByIdentifier = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await productsService.getByIdentifier(req.params.identifier);
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await productsService.getByIdentifier(req.params.identifier, isAdmin);
     res.status(200).json(successResponse(result, 'Product retrieved'));
   } catch (error) {
     next(error);
@@ -48,7 +46,12 @@ export const getByCategorySlug = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await productsService.getByCategorySlug(req.params.slug, req.query as unknown as ProductListQuery);
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await productsService.getByCategorySlug(
+      req.params.slug,
+      req.query as unknown as ProductListQuery,
+      isAdmin
+    );
     res.status(200).json(paginatedResponse(result.items, result.meta));
   } catch (error) {
     next(error);

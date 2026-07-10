@@ -168,7 +168,7 @@ model Product {
 
 model ProductVariant {
   id                String   @id @default(cuid())
-  productId         String
+  productId         String   
   sku               String   @unique
   name              String
   price             Decimal  @db.Decimal(10, 2)
@@ -198,6 +198,7 @@ model ProductImage {
   id        String  @id @default(cuid())
   productId String
   url       String
+  publicId   String  // Cloudinary asset id, needed to delete the actual file
   altText   String?
   sortOrder Int     @default(0)
   isPrimary Boolean @default(false)
