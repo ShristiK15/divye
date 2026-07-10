@@ -384,37 +384,42 @@ export const productsService = {
     if (!product) {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
-
+  
     const existingCount = await prisma.productImage.count({ where: { productId } });
-    const uploaded = [];
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const result = await new Promise<{ secure_url: string; public_id: string }>((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          { folder: 'divye/products', resource_type: 'image' },
-          (error, uploadResult) => {
-            if (error || !uploadResult) reject(error ?? new Error('Upload failed'));
-            else resolve(uploadResult);
-          }
-        );
-        stream.end(file.buffer);
-      });
-
-      const image = await prisma.productImage.create({
-        data: {
-          productId,
-          url: result.secure_url,
-          publicId: result.public_id,
-          altText: product.name,
-          sortOrder: existingCount + i,
-          isPrimary: existingCount === 0 && i === 0,
-        },
-      });
-      uploaded.push(image);
-    }
-
-    return uploaded;
+  
+    const uploadResults = await Promise.all(
+      files.map((file) =>
+        new Promise<{ secure_url: string; public_id: string }>((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { folder: 'divye/products', resource_type: 'image' },
+            (error, uploadResult) => {
+              if (error || !uploadResult) reject(error ?? new Error('Upload failed'));
+              else resolve(uploadResult);
+            }
+          );
+          stream.end(file.buffer);
+        })
+      )
+    );
+  
+    const uploaded = await prisma.productImage.createMany({
+      data: uploadResults.map((result, i) => ({
+        productId,
+        url: result.secure_url,
+        publicId: result.public_id,
+        altText: product.name,
+        sortOrder: existingCount + i,
+        isPrimary: existingCount === 0 && i === 0,
+      })),
+    });
+  
+    // createMany doesn't return the created rows — refetch if the caller needs full image records
+    return prisma.productImage.findMany({
+      where: { productId },
+      orderBy: { sortOrder: 'asc' },
+      take: uploadResults.length,
+      skip: existingCount,
+    });
   },
 
   async removeImage(productId: string, imageId: string): Promise<void> {
