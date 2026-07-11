@@ -128,7 +128,7 @@ export const ordersService = {
                 quantity: item.quantity,
                 unitPrice: item.variant.price,
                 gstPercent: item.variant.gstPercent,
-                totalPrice: toDecimal(breakdown.total),
+                totalPrice: toDecimal(breakdown.total.toString()),
               };
             }),
           },

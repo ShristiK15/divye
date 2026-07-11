@@ -16,6 +16,17 @@ export function mapPrismaError(error: unknown): AppError {
         return new AppError('Record not found', 404, ErrorCodes.NOT_FOUND);
       case 'P2003':
         return new AppError('Related record not found', 400, ErrorCodes.BAD_REQUEST);
+      case 'P2028':
+        // Transaction API error — most commonly a lock-wait/transaction
+        // timeout under concurrent load (e.g. multiple requests racing
+        // on the same FOR UPDATE-locked row in cart addItem/updateItem).
+        // Transient by nature, so 409 + a retry-worthy message rather
+        // than a 500.
+        return new AppError(
+          'This action could not be completed due to high demand, please try again',
+          409,
+          ErrorCodes.CONFLICT
+        );
       default:
         return new AppError('Database operation failed', 500, ErrorCodes.INTERNAL_ERROR);
     }

@@ -1,15 +1,31 @@
+import Decimal from 'decimal.js';
+
 type DecimalLike = { toString(): string };
+
+export interface GstBreakdown {
+  subtotal: Decimal;
+  gstAmount: Decimal;
+  total: Decimal;
+}
 
 export function calculateGstBreakdown(
   inclusivePrice: DecimalLike,
   gstPercent: DecimalLike,
   quantity: number
-): { subtotal: number; gstAmount: number; total: number } {
-  const price = Number(inclusivePrice.toString());
-  const gst = Number(gstPercent.toString());
-  const lineTotal = price * quantity;
-  const subtotal = lineTotal / (1 + gst / 100);
-  const gstAmount = lineTotal - subtotal;
+): GstBreakdown {
+  if (typeof inclusivePrice === 'number' || typeof gstPercent === 'number') {
+    throw new TypeError(
+      'calculateGstBreakdown received a plain number — pass a Decimal or decimal string to avoid float precision loss'
+    );
+  }
+
+  const price = new Decimal(inclusivePrice.toString());
+  const gst = new Decimal(gstPercent.toString());
+
+  const lineTotal = price.times(quantity);
+  const divisor = new Decimal(1).plus(gst.div(100));
+  const subtotal = lineTotal.div(divisor);
+  const gstAmount = lineTotal.minus(subtotal);
 
   return {
     subtotal: roundMoney(subtotal),
@@ -18,6 +34,7 @@ export function calculateGstBreakdown(
   };
 }
 
-export function roundMoney(value: number): number {
-  return Math.round(value * 100) / 100;
+export function roundMoney(value: Decimal | number): Decimal {
+  const d = value instanceof Decimal ? value : new Decimal(value);
+  return d.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
 }
