@@ -5,14 +5,15 @@ import {
   prisma,
   Prisma,
 } from '@divye/database';
-import { calculateGstBreakdown, parseDecimal } from '@divye/shared';
+import {parseDecimal} from '@divye/shared/utils/decimal';
+import { calculateGstBreakdown} from '@divye/shared';
 import Decimal from 'decimal.js';
 import { AppError, ErrorCodes } from '../../utils/app-error';
 import { buildPaginationMeta } from '../../utils/response';
 import { toDecimal } from '../../utils/decimal';
 import { cartService } from '../cart/cart.service';
 import { notificationService } from '../notifications/notification.service';
-import { shippingService } from '../shipping/shipping.service';
+import { settingsService } from '../settings/settings.service';
 import { logger } from '../../utils/logger';
 import type {
   AdminOrdersQuery,
@@ -112,9 +113,23 @@ export const ordersService = {
 
     // Shipping charge computed server-side — never trust dto.shippingCharge from the client.
     const subtotalAfterDiscount = subtotalBeforeDiscount.sub(discountAmount);
-    const shippingCharge = await shippingService.calculateCharge(subtotalAfterDiscount);
+    const settings = await settingsService.getSettings();
+    const shippingCharge = settingsService.computeShippingCharge(settings, subtotalAfterDiscount);
     const gstAmount = parseDecimal(validation.totals.gstAmount);
     const totalAmount = subtotalAfterDiscount.add(gstAmount).add(shippingCharge);
+
+    // COD eligibility is checked against the final payable amount, after
+    // discount, GST, and shipping — not the raw cart subtotal.
+    if (dto.paymentMethod === PaymentMethod.COD) {
+      const codCheck = settingsService.checkCodEligibility(settings, totalAmount);
+      if (!codCheck.eligible) {
+        throw new AppError(
+          codCheck.reason ?? 'Cash on Delivery is not available for this order',
+          400,
+          ErrorCodes.BAD_REQUEST
+        );
+      }
+    }
 
     const order = await prisma.$transaction(async (tx) => {
       // Atomic conditional stock reservation — checked and applied in one statement

@@ -439,3 +439,13 @@ model OrderSequence {
   year  Int @id
   value Int @default(0)
 }
+
+model AppSettings {
+  id                    Int      @id @default(1)
+  freeShippingThreshold Decimal  @db.Decimal(10, 2)
+  flatShippingCharge    Decimal  @db.Decimal(10, 2)
+  codEnabled            Boolean  @default(true)
+  codMinOrderValue      Decimal  @db.Decimal(10, 2) @default(0)
+  codMaxOrderValue      Decimal? @db.Decimal(10, 2) // null = no upper limit
+  updatedAt             DateTime @updatedAt
+}
