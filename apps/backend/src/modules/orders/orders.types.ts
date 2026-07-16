@@ -13,7 +13,7 @@ export const updateOrderStatusSchema = z.object({
   status: z.nativeEnum(OrderStatus),
   note: z.string().optional(),
   trackingId: z.string().optional(),
-  carrier: z.string().optional(),
+  carrierId: z.string().cuid().optional(),
 });
 
 export const adminOrdersQuerySchema = z.object({

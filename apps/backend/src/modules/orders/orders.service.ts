@@ -5,12 +5,15 @@ import {
   prisma,
   Prisma,
 } from '@divye/database';
-import { calculateGstBreakdown } from '@divye/shared';
+import { calculateGstBreakdown, parseDecimal } from '@divye/shared';
+import Decimal from 'decimal.js';
 import { AppError, ErrorCodes } from '../../utils/app-error';
 import { buildPaginationMeta } from '../../utils/response';
 import { toDecimal } from '../../utils/decimal';
 import { cartService } from '../cart/cart.service';
 import { notificationService } from '../notifications/notification.service';
+import { shippingService } from '../shipping/shipping.service';
+import { logger } from '../../utils/logger';
 import type {
   AdminOrdersQuery,
   PlaceOrderDto,
@@ -18,31 +21,48 @@ import type {
   UserOrdersQuery,
 } from './orders.types';
 
-async function generateOrderNumber(): Promise<string> {
-  const year = new Date().getFullYear();
-  const prefix = `DE-${year}-`;
+// Allowed forward transitions per the full OrderStatus enum in schema.prisma.
+// RETURN_REQUESTED -> DELIVERED covers a rejected return request.
+const ALLOWED_STATUS_TRANSITIONS: Record<string, string[]> = {
+  PENDING: ['CONFIRMED', 'CANCELLED'],
+  CONFIRMED: ['PROCESSING', 'CANCELLED'],
+  PROCESSING: ['SHIPPED', 'CANCELLED'],
+  SHIPPED: ['OUT_FOR_DELIVERY'],
+  OUT_FOR_DELIVERY: ['DELIVERED'],
+  DELIVERED: ['RETURN_REQUESTED'],
+  RETURN_REQUESTED: ['RETURNED', 'DELIVERED'],
+  RETURNED: ['REFUNDED'],
+  CANCELLED: ['REFUNDED'],
+  REFUNDED: [],
+};
 
-  const lastOrder = await prisma.order.findFirst({
-    where: { orderNumber: { startsWith: prefix } },
-    orderBy: { orderNumber: 'desc' },
-  });
-
-  let sequence = 1;
-  if (lastOrder) {
-    const lastSeq = parseInt(lastOrder.orderNumber.split('-')[2], 10);
-    sequence = lastSeq + 1;
-  }
-
-  return `${prefix}${sequence.toString().padStart(5, '0')}`;
-}
+// Statuses an admin can move an order to regardless of payment state.
+const PAYMENT_GUARD_EXEMPT_STATUSES = new Set<string>([
+  OrderStatus.CANCELLED,
+  OrderStatus.RETURN_REQUESTED,
+]);
 
 const orderInclude = {
   items: true,
   address: true,
   payment: true,
+  carrier: true,
   statusHistory: { orderBy: { createdAt: 'desc' as const } },
   user: { select: { id: true, email: true, name: true, phone: true } },
 };
+
+// Atomic order-number generation via the OrderSequence table, called inside
+// the same transaction as order creation. Requires:
+//   model OrderSequence { year Int @id; value Int @default(0) }
+async function generateOrderNumber(tx: Prisma.TransactionClient): Promise<string> {
+  const year = new Date().getFullYear();
+  const seq = await tx.orderSequence.upsert({
+    where: { year },
+    create: { year, value: 1 },
+    update: { value: { increment: 1 } },
+  });
+  return `DE-${year}-${seq.value.toString().padStart(6, '0')}`;
+}
 
 export const ordersService = {
   async placeOrder(userId: string, dto: PlaceOrderDto) {
@@ -63,7 +83,12 @@ export const ordersService = {
       throw new AppError('Cart is empty', 400, ErrorCodes.BAD_REQUEST);
     }
 
-    let discountAmount = 0;
+    const subtotalBeforeDiscount = parseDecimal(validation.totals.subtotal);
+
+    // Coupon validity + discount math via decimal.js (not parseFloat/Number).
+    // Usage-limit is re-checked atomically inside the transaction below —
+    // this initial check is just for a fast, friendly error before we start.
+    let discountAmount = new Decimal(0);
     if (dto.couponCode) {
       const coupon = await prisma.coupon.findUnique({ where: { code: dto.couponCode } });
       if (!coupon?.isActive || (coupon.expiresAt && coupon.expiresAt < new Date())) {
@@ -72,47 +97,77 @@ export const ordersService = {
       if (coupon.usageLimit && coupon.usageCount >= coupon.usageLimit) {
         throw new AppError('Coupon usage limit reached', 400, ErrorCodes.BAD_REQUEST);
       }
-      const subtotalNum = parseFloat(validation.totals.subtotal);
-      if (coupon.minOrderValue && subtotalNum < Number(coupon.minOrderValue)) {
+      if (coupon.minOrderValue && subtotalBeforeDiscount.lt(parseDecimal(coupon.minOrderValue))) {
         throw new AppError('Order does not meet minimum value for coupon', 400, ErrorCodes.BAD_REQUEST);
       }
       if (coupon.discountType === 'PERCENTAGE') {
-        discountAmount = subtotalNum * (Number(coupon.discountValue) / 100);
+        discountAmount = subtotalBeforeDiscount.mul(parseDecimal(coupon.discountValue)).div(100);
         if (coupon.maxDiscount) {
-          discountAmount = Math.min(discountAmount, Number(coupon.maxDiscount));
+          discountAmount = Decimal.min(discountAmount, parseDecimal(coupon.maxDiscount));
         }
       } else {
-        discountAmount = Number(coupon.discountValue);
+        discountAmount = parseDecimal(coupon.discountValue);
       }
     }
 
-    const orderNumber = await generateOrderNumber();
-    const subtotal = toDecimal(parseFloat(validation.totals.subtotal) - discountAmount);
-    const gstAmount = toDecimal(validation.totals.gstAmount);
-    const shippingCharge = toDecimal(dto.shippingCharge);
-    const totalAmount = toDecimal(
-      parseFloat(validation.totals.total) - discountAmount + dto.shippingCharge
-    );
+    // Shipping charge computed server-side — never trust dto.shippingCharge from the client.
+    const subtotalAfterDiscount = subtotalBeforeDiscount.sub(discountAmount);
+    const shippingCharge = await shippingService.calculateCharge(subtotalAfterDiscount);
+    const gstAmount = parseDecimal(validation.totals.gstAmount);
+    const totalAmount = subtotalAfterDiscount.add(gstAmount).add(shippingCharge);
 
     const order = await prisma.$transaction(async (tx) => {
+      // Atomic conditional stock reservation — checked and applied in one statement
+      // per item, so two concurrent checkouts can't both pass a pre-transaction
+      // stock check and both oversell the last unit.
+      for (const item of cart.items) {
+        const affected = await tx.$executeRaw`
+          UPDATE "ProductVariant"
+          SET "reservedQty" = "reservedQty" + ${item.quantity}
+          WHERE id = ${item.variantId}
+            AND "stockQty" - "reservedQty" >= ${item.quantity}
+        `;
+        if (affected === 0) {
+          throw new AppError(
+            `Insufficient stock for ${item.product.name} (${item.variant.name})`,
+            409,
+            ErrorCodes.CONFLICT
+          );
+        }
+      }
+
+      // Atomic conditional coupon usage increment — re-checked at write time in
+      // case the usage limit was hit between the initial read above and now.
+      if (dto.couponCode) {
+        const couponAffected = await tx.$executeRaw`
+          UPDATE "Coupon"
+          SET "usageCount" = "usageCount" + 1
+          WHERE code = ${dto.couponCode}
+            AND "isActive" = true
+            AND ("usageLimit" IS NULL OR "usageCount" < "usageLimit")
+        `;
+        if (couponAffected === 0) {
+          throw new AppError('Coupon is no longer valid', 400, ErrorCodes.BAD_REQUEST);
+        }
+      }
+
+      const orderNumber = await generateOrderNumber(tx);
+
       const created = await tx.order.create({
         data: {
           orderNumber,
           userId,
           addressId: dto.addressId,
           paymentMethod: dto.paymentMethod,
-          subtotal,
-          discountAmount: toDecimal(discountAmount),
-          shippingCharge,
-          gstAmount,
-          totalAmount,
+          subtotal: toDecimal(subtotalAfterDiscount.toString()),
+          discountAmount: toDecimal(discountAmount.toString()),
+          shippingCharge: toDecimal(shippingCharge.toString()),
+          gstAmount: toDecimal(gstAmount.toString()),
+          totalAmount: toDecimal(totalAmount.toString()),
           couponCode: dto.couponCode,
           notes: dto.notes,
           status: OrderStatus.PENDING,
-          paymentStatus:
-            dto.paymentMethod === PaymentMethod.COD
-              ? PaymentStatus.PENDING
-              : PaymentStatus.PENDING,
+          paymentStatus: PaymentStatus.PENDING,
           items: {
             create: cart.items.map((item) => {
               const breakdown = calculateGstBreakdown(
@@ -135,7 +190,7 @@ export const ordersService = {
           payment: {
             create: {
               method: dto.paymentMethod,
-              amount: totalAmount,
+              amount: toDecimal(totalAmount.toString()),
               status: PaymentStatus.PENDING,
             },
           },
@@ -146,26 +201,14 @@ export const ordersService = {
         include: orderInclude,
       });
 
-      for (const item of cart.items) {
-        await tx.productVariant.update({
-          where: { id: item.variantId },
-          data: { reservedQty: { increment: item.quantity } },
-        });
-      }
-
       await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
-
-      if (dto.couponCode) {
-        await tx.coupon.update({
-          where: { code: dto.couponCode },
-          data: { usageCount: { increment: 1 } },
-        });
-      }
 
       return created;
     });
 
-    notificationService.sendOrderConfirmation(order, order.user).catch(() => {});
+    notificationService.sendOrderConfirmation(order, order.user).catch((err) => {
+      logger.error('Failed to send order confirmation', { orderId: order.id, err });
+    });
 
     return order;
   },
@@ -243,7 +286,9 @@ export const ordersService = {
       }
     });
 
-    notificationService.sendOrderCancelled(order, order.user).catch(() => {});
+    notificationService.sendOrderCancelled(order, order.user).catch((err) => {
+      logger.error('Failed to send cancellation notification', { orderId: order.id, err });
+    });
   },
 
   async requestReturn(orderId: string, userId: string) {
@@ -303,14 +348,35 @@ export const ordersService = {
   async updateStatus(orderId: string, dto: UpdateOrderStatusDto) {
     const order = await prisma.order.findUnique({
       where: { id: orderId },
-      include: { user: { select: { id: true, email: true, name: true, phone: true } } },
+      include: { items: true, user: { select: { id: true, email: true, name: true, phone: true } } },
     });
 
     if (!order) {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
 
+    // Reject illegal status transitions
+    const allowedNext = ALLOWED_STATUS_TRANSITIONS[order.status] ?? [];
+    if (!allowedNext.includes(dto.status)) {
+      throw new AppError(
+        `Cannot transition order from ${order.status} to ${dto.status}`,
+        400,
+        ErrorCodes.BAD_REQUEST
+      );
+    }
+
+    // Validate carrier reference, if provided
+    if (dto.carrierId) {
+      const carrier = await prisma.carrier.findFirst({ where: { id: dto.carrierId, isActive: true } });
+      if (!carrier) {
+        throw new AppError('Invalid carrier', 400, ErrorCodes.BAD_REQUEST);
+      }
+    }
+
+    // CANCELLED/RETURN_REQUESTED are exempt — this guard is meant to stop
+    // fulfillment progressing without payment, not to block terminating a dead order.
     if (
+      !PAYMENT_GUARD_EXEMPT_STATUSES.has(dto.status) &&
       dto.status !== OrderStatus.PENDING &&
       order.paymentStatus !== PaymentStatus.PAID &&
       order.paymentMethod !== PaymentMethod.COD
@@ -318,28 +384,55 @@ export const ordersService = {
       throw new AppError('Payment must be completed before status update', 400, ErrorCodes.BAD_REQUEST);
     }
 
-    await prisma.$transaction([
-      prisma.order.update({
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({
         where: { id: orderId },
         data: {
           status: dto.status,
+          ...(dto.status === OrderStatus.CANCELLED && {
+            paymentStatus:
+              order.paymentStatus === PaymentStatus.PAID
+                ? PaymentStatus.REFUNDED
+                : PaymentStatus.FAILED,
+          }),
           ...(dto.trackingId && { trackingId: dto.trackingId }),
-          ...(dto.carrier && { carrier: dto.carrier }),
+          ...(dto.carrierId && { carrierId: dto.carrierId }),
         },
-      }),
-      prisma.orderStatusHistory.create({
+      });
+
+      await tx.orderStatusHistory.create({
         data: { orderId, status: dto.status, note: dto.note },
-      }),
-    ]);
+      });
+
+      // Release reserved stock on admin cancellation — the customer-facing
+      // cancelOrder already does this; this path did not, leaving stock
+      // permanently locked for orders admins cancel.
+      if (dto.status === OrderStatus.CANCELLED) {
+        for (const item of order.items) {
+          await tx.productVariant.update({
+            where: { id: item.variantId },
+            data: { reservedQty: { decrement: item.quantity } },
+          });
+        }
+      }
+    });
 
     if (dto.status === OrderStatus.SHIPPED && dto.trackingId) {
       notificationService
         .sendOrderShipped(order, order.user, dto.trackingId)
-        .catch(() => {});
+        .catch((err) => logger.error('Failed to send shipped notification', { orderId, err }));
     }
 
     if (dto.status === OrderStatus.DELIVERED) {
-      notificationService.sendOrderDelivered(order, order.user).catch(() => {});
+      notificationService
+        .sendOrderDelivered(order, order.user)
+        .catch((err) => logger.error('Failed to send delivered notification', { orderId, err }));
+    }
+
+    if (dto.status === OrderStatus.CANCELLED) {
+      notificationService
+        .sendOrderCancelled(order, order.user)
+        .catch((err) => logger.error('Failed to send cancellation notification', { orderId, err }));
     }
   },
 };

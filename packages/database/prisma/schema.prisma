@@ -321,7 +321,7 @@ model Order {
   couponCode     String?
   notes          String?
   trackingId     String?
-  carrier        String?
+  carrierId        String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -330,6 +330,7 @@ model Order {
   items         OrderItem[]
   payment       Payment?
   statusHistory OrderStatusHistory[]
+  carrier       Carrier?             @relation(fields: [carrierId], references: [id])
 
   @@index([userId])
   @@index([status])
@@ -415,4 +416,26 @@ model Review {
 
   @@unique([userId, productId])
   @@index([productId])
+}
+
+
+model Carrier {
+  id                  String   @id @default(cuid())
+  label               String   // e.g. "Delhivery", "Sri Balaji Couriers"
+  trackingUrlTemplate String?  // e.g. "https://www.delhivery.com/track/package/{trackingId}"
+                                // {trackingId} is replaced at render time; if there's no
+                                // placeholder (or the field is null), frontend just links to
+                                // the base URL and the user pastes the ID themselves
+  isSystem            Boolean  @default(false) // true for pre-seeded carriers; blocks deletion
+  isActive            Boolean  @default(true)  // soft-disable instead of delete, so historical orders keep a valid reference
+  createdAt           DateTime @default(now())
+
+  orders Order[]
+
+  @@index([isActive])
+}
+
+model OrderSequence {
+  year  Int @id
+  value Int @default(0)
 }
