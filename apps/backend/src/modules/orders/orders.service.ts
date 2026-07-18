@@ -4,6 +4,7 @@ import {
   PaymentStatus,
   prisma,
   Prisma,
+  StockMovementType,
 } from '@divye/database';
 import {parseDecimal} from '@divye/shared/utils/decimal';
 import { calculateGstBreakdown} from '@divye/shared';
@@ -63,6 +64,36 @@ async function generateOrderNumber(tx: Prisma.TransactionClient): Promise<string
     update: { value: { increment: 1 } },
   });
   return `DE-${year}-${seq.value.toString().padStart(6, '0')}`;
+}
+
+// Restores stock sold at confirm time (fulfillPayment / confirmCod already
+// decremented stockQty as a real SALE). Cancelling a CONFIRMED/PROCESSING
+// order must give that stock back — reservedQty is already 0 for these
+// items, so decrementing it further (the old bug) would push it negative.
+async function restoreStockForOrder(
+  tx: Prisma.TransactionClient,
+  order: { orderNumber: string; items: { variantId: string; quantity: number }[] }
+): Promise<void> {
+  for (const item of order.items) {
+    const variant = await tx.productVariant.findUnique({ where: { id: item.variantId } });
+    if (!variant) continue;
+    const quantityBefore = variant.stockQty;
+    const quantityAfter = quantityBefore + item.quantity;
+    await tx.productVariant.update({
+      where: { id: item.variantId },
+      data: { stockQty: { increment: item.quantity } },
+    });
+    await tx.inventoryLog.create({
+      data: {
+        variantId: item.variantId,
+        type: StockMovementType.RETURN,
+        quantityBefore,
+        quantityChange: item.quantity,
+        quantityAfter,
+        reference: order.orderNumber,
+      },
+    });
+  }
 }
 
 export const ordersService = {
@@ -277,28 +308,43 @@ export const ordersService = {
       throw new AppError('Order cannot be cancelled at this stage', 400, ErrorCodes.BAD_REQUEST);
     }
 
-    await prisma.$transaction(async (tx) => {
-      await tx.order.update({
-        where: { id: orderId },
-        data: {
-          status: OrderStatus.CANCELLED,
-          paymentStatus:
-            order.paymentStatus === PaymentStatus.PAID
-              ? PaymentStatus.REFUNDED
-              : PaymentStatus.FAILED,
-        },
-      });
+    // Stock is only a *reservation* while PENDING. Once CONFIRMED, it was
+    // already sold (stockQty decremented) — cancelling from there restores
+    // stock rather than releasing a reservation that's already 0.
+    const stockAlreadySold = order.status !== OrderStatus.PENDING;
 
+    await prisma.$transaction(async (tx) => {
+      // Idempotency guard against a duplicate/double-submitted cancel request.
+    const orderUpdate = await tx.order.updateMany({
+      where: { id: orderId, status: order.status },
+      data: {
+        status: OrderStatus.CANCELLED,
+        // No refund has actually happened yet — don't fabricate REFUNDED.
+        // A PAID order stays PAID (= "refund owed") until an admin
+        // explicitly calls POST /refund/:orderId.
+        paymentStatus:
+          order.paymentStatus === PaymentStatus.PAID
+            ? PaymentStatus.PAID
+            : PaymentStatus.FAILED,
+      },
+    });
+    if (orderUpdate.count === 0) {
+      throw new AppError('Order was already updated, please retry', 409, ErrorCodes.CONFLICT);
+    }
       await tx.orderStatusHistory.create({
         data: { orderId, status: OrderStatus.CANCELLED, note: 'Cancelled by customer' },
       });
 
-      for (const item of order.items) {
-        await tx.productVariant.update({
-          where: { id: item.variantId },
-          data: { reservedQty: { decrement: item.quantity } },
-        });
-      }
+    if (stockAlreadySold) {
+          await restoreStockForOrder(tx, order);
+        } else {
+          for (const item of order.items) {
+            await tx.productVariant.update({
+              where: { id: item.variantId },
+              data: { reservedQty: { decrement: item.quantity } },
+            });
+          }
+        }
     });
 
     notificationService.sendOrderCancelled(order, order.user).catch((err) => {
@@ -399,30 +445,47 @@ export const ordersService = {
       throw new AppError('Payment must be completed before status update', 400, ErrorCodes.BAD_REQUEST);
     }
 
+    const stockAlreadySold = order.status !== OrderStatus.PENDING;
+
     await prisma.$transaction(async (tx) => {
-      await tx.order.update({
-        where: { id: orderId },
-        data: {
-          status: dto.status,
-          ...(dto.status === OrderStatus.CANCELLED && {
-            paymentStatus:
-              order.paymentStatus === PaymentStatus.PAID
-                ? PaymentStatus.REFUNDED
-                : PaymentStatus.FAILED,
-          }),
-          ...(dto.trackingId && { trackingId: dto.trackingId }),
-          ...(dto.carrierId && { carrierId: dto.carrierId }),
-        },
-      });
+    // Atomic guard: only apply if the order is still in the exact status
+    // we validated the transition against. If it's moved on (a concurrent
+    // admin action, or this same request retried/double-submitted), the
+    // transition we approved is now stale — reject rather than overwrite
+    // whatever the other write did.
+    const orderUpdate = await tx.order.updateMany({
+      where: { id: orderId, status: order.status },
+      data: {
+        status: dto.status,
+        ...(dto.status === OrderStatus.CANCELLED && {
+          paymentStatus:
+            order.paymentStatus === PaymentStatus.PAID
+              ? PaymentStatus.PAID
+              : PaymentStatus.FAILED,
+        }),
+        ...(dto.trackingId && { trackingId: dto.trackingId }),
+        ...(dto.carrierId && { carrierId: dto.carrierId }),
+      },
+    });
+    if (orderUpdate.count === 0) {
+      throw new AppError(
+        'Order status changed concurrently, please refresh and retry',
+        409,
+        ErrorCodes.CONFLICT
+      );
+    }
 
       await tx.orderStatusHistory.create({
         data: { orderId, status: dto.status, note: dto.note },
       });
-
-      // Release reserved stock on admin cancellation — the customer-facing
-      // cancelOrder already does this; this path did not, leaving stock
-      // permanently locked for orders admins cancel.
-      if (dto.status === OrderStatus.CANCELLED) {
+      
+      // PENDING orders only ever had stock reserved; CONFIRMED/PROCESSING
+      // orders already had it sold at confirm time and need restoring
+      // instead of a reservedQty release (see cancelOrder for the same
+      // distinction).
+      if (stockAlreadySold) {
+        await restoreStockForOrder(tx, order);
+      } else {
         for (const item of order.items) {
           await tx.productVariant.update({
             where: { id: item.variantId },
@@ -430,6 +493,12 @@ export const ordersService = {
           });
         }
       }
+     // RETURN_REQUESTED -> RETURNED is only reachable from DELIVERED, which
+     // always means stock was already sold (never just reserved) — no
+     // PENDING branch needed here, unlike CANCELLED which can happen pre-sale.
+     if (dto.status === OrderStatus.RETURNED) {
+       await restoreStockForOrder(tx, order);
+     }
     });
 
     if (dto.status === OrderStatus.SHIPPED && dto.trackingId) {

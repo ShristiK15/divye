@@ -21,8 +21,9 @@ enum OrderStatus {
   DELIVERED
   CANCELLED
   RETURN_REQUESTED
-  RETURNED
+  RETURNED  
   REFUNDED
+  EXPIRED
 }
 
 enum PaymentStatus {
@@ -31,6 +32,7 @@ enum PaymentStatus {
   FAILED
   REFUNDED
   PARTIALLY_REFUNDED
+  REFUND_PROCESSING
 }
 
 enum PaymentMethod {
@@ -321,16 +323,16 @@ model Order {
   couponCode     String?
   notes          String?
   trackingId     String?
-  carrierId        String?
+  carrierId      String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
-
-  user          User                 @relation(fields: [userId], references: [id])
-  address       Address              @relation(fields: [addressId], references: [id])
-  items         OrderItem[]
-  payment       Payment?
-  statusHistory OrderStatusHistory[]
-  carrier       Carrier?             @relation(fields: [carrierId], references: [id])
+  expiresAt      DateTime?
+  user           User                 @relation(fields: [userId], references: [id])
+  address        Address              @relation(fields: [addressId], references: [id])
+  items          OrderItem[]
+  payment        Payment?
+  statusHistory  OrderStatusHistory[]
+  carrier        Carrier?             @relation(fields: [carrierId], references: [id])
 
   @@index([userId])
   @@index([status])
@@ -448,4 +450,11 @@ model AppSettings {
   codMinOrderValue      Decimal  @db.Decimal(10, 2) @default(0)
   codMaxOrderValue      Decimal? @db.Decimal(10, 2) // null = no upper limit
   updatedAt             DateTime @updatedAt
+}
+
+model WebhookEvent {
+  id        String   @id @default(cuid())
+  eventKey  String   @unique
+  eventType String
+  createdAt DateTime @default(now())
 }

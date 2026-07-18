@@ -5,4 +5,8 @@ export const createCarrierSchema = z.object({
   trackingUrlTemplate: z.string().url().optional().or(z.literal('')),
 });
 
+export const carrierIdParamSchema = z.object({
+  id: z.string().cuid(),
+});
+
 export type CreateCarrierDto = z.infer<typeof createCarrierSchema>;
