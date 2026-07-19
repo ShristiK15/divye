@@ -1,6 +1,7 @@
 import { prisma } from '@divye/database';
-import { parseDecimal } from '@divye/shared';
+import { parseDecimal } from '@divye/shared/utils/decimal';
 import Decimal from 'decimal.js';
+import { homepageService } from './homepage.service';
 import type { UpdateAppSettingsDto } from './settings.types';
 
 const SETTINGS_ID = 1;
@@ -105,18 +106,19 @@ export const settingsService = {
 
   /**
    * Customer-facing subset of settings — used by the storefront checkout
-   * page to show/hide the COD option and the free-shipping threshold
-   * *before* the customer submits an order, rather than only finding out
-   * via a 400 from placeOrder. No auth required to call this.
+   * page and homepage hero section to know what to render *before* the
+   * customer takes any action. No auth required to call this.
    */
   async getPublicSettings() {
     const settings = await this.getSettings();
+    const heroImages = await homepageService.heroImages.list();
     return {
       freeShippingThreshold: settings.freeShippingThreshold,
       flatShippingCharge: settings.flatShippingCharge,
       codEnabled: settings.codEnabled,
       codMinOrderValue: settings.codMinOrderValue,
       codMaxOrderValue: settings.codMaxOrderValue,
+      heroImages,
     };
   },
 };

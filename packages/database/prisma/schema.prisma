@@ -458,3 +458,15 @@ model WebhookEvent {
   eventType String
   createdAt DateTime @default(now())
 }
+
+model HeroImage {
+  id        String   @id @default(cuid())
+  url       String
+  publicId  String   // Cloudinary asset id, needed to delete the actual file
+  altText   String   @default("")
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sortOrder])
+}
