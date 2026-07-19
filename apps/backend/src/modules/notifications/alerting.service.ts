@@ -12,7 +12,7 @@ export const alertingService = {
     try {
       await resend.emails.send({
         from: env.EMAIL_FROM,
-        to: env.ADMIN_ALERT_EMAIL,
+        to: env.ADMIN_EMAIL,
         subject: `[Divye Alert] ${subject}`,
         html: `
           <h2>${subject}</h2>
