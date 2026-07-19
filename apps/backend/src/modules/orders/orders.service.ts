@@ -36,7 +36,22 @@ const ALLOWED_STATUS_TRANSITIONS: Record<string, string[]> = {
   RETURNED: ['REFUNDED'],
   CANCELLED: ['REFUNDED'],
   REFUNDED: [],
+ // EXPIRED is entered by tryExpireOrder (system-driven, not via
+ // updateStatus). It's not fully terminal: a late-arriving payment can
+ // still recover it back to CONFIRMED if stock is re-available, or move
+ // it to REFUNDED if the payment is accepted but stock is gone. Neither
+ // transition is applied through updateStatus/this map (they're direct
+ // service writes from payments.service's late-recovery flow) — this
+ // entry exists for documentation/consistency, not enforcement.
+  EXPIRED: ['CONFIRMED', 'REFUNDED'],
 };
+
+// Payment window: how long a PENDING order holds its stock reservation
+// before it's eligible to expire. Applies uniformly to Razorpay and COD --
+// both reserve stock at placeOrder time and both need a bound on how long
+// an abandoned checkout can hold that reservation.
+const ORDER_PENDING_TIMEOUT_MINUTES = 5;
+
 
 // Statuses an admin can move an order to regardless of payment state.
 const PAYMENT_GUARD_EXEMPT_STATUSES = new Set<string>([
@@ -214,6 +229,7 @@ export const ordersService = {
           notes: dto.notes,
           status: OrderStatus.PENDING,
           paymentStatus: PaymentStatus.PENDING,
+          expiresAt: new Date(Date.now() + ORDER_PENDING_TIMEOUT_MINUTES * 60 * 1000),
           items: {
             create: cart.items.map((item) => {
               const breakdown = calculateGstBreakdown(
@@ -303,6 +319,20 @@ export const ordersService = {
     if (!order) {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
+
+   // Lazy-check backstop: if this PENDING order's payment window already
+   // passed but the sweep job hasn't reached it yet, expire it now rather
+   // than falling through to the generic "cannot be cancelled" rejection
+   // below (EXPIRED isn't in the PENDING/CONFIRMED check) — gives the
+   // customer an accurate reason instead of a confusing dead end, and
+   // ensures it's correctly logged as EXPIRED, not left silently stuck.
+   if (await tryExpireOrder(order.id)) {
+     throw new AppError(
+       'This order has expired as payment was not completed in time',
+       409,
+       ErrorCodes.CONFLICT
+     );
+   }
 
     if (order.status !== OrderStatus.PENDING && order.status !== OrderStatus.CONFIRMED) {
       throw new AppError('Order cannot be cancelled at this stage', 400, ErrorCodes.BAD_REQUEST);
@@ -520,3 +550,68 @@ export const ordersService = {
     }
   },
 };
+
+// Expires a single PENDING order past its expiresAt cutoff: releases its
+// stock reservation and marks it EXPIRED. Called from two places --
+// the periodic sweep job (source of truth) and lazy checks at the start
+// of payment-related actions (fast-path backstop, so a user retrying a
+// stale checkout gets an immediate, correct rejection instead of waiting
+// for the next sweep).
+//
+// The atomic updateMany guard means concurrent callers (the sweep job and
+// a lazy check landing on the same order at the same moment, or two lazy
+// checks racing) can't both act on it -- only one wins, the other sees
+// count === 0 and no-ops. Returns whether *this* call expired the order.
+export async function tryExpireOrder(orderId: string): Promise<boolean> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { items: true, user: { select: { id: true, email: true, name: true, phone: true } } },
+  });
+
+  if (!order) return false;
+  if (order.status !== OrderStatus.PENDING) return false;
+  if (!order.expiresAt || order.expiresAt > new Date()) return false;
+
+  const expired = await prisma.$transaction(async (tx) => {
+    const orderUpdate = await tx.order.updateMany({
+      where: { id: orderId, status: OrderStatus.PENDING },
+      data: {
+        status: OrderStatus.EXPIRED,
+        paymentStatus: PaymentStatus.FAILED,
+      },
+    });
+
+    if (orderUpdate.count === 0) return false;
+
+    await tx.orderStatusHistory.create({
+      data: {
+        orderId,
+        status: OrderStatus.EXPIRED,
+        note: 'Payment window expired, reservation released',
+      },
+    });
+
+    // PENDING orders never reach fulfillPayment/confirmCod, so stock here
+    // was only ever reserved, never sold -- release reservedQty, not a
+    // stockQty restore (unlike cancelOrder's CONFIRMED-order branch).
+    for (const item of order.items) {
+      await tx.productVariant.update({
+        where: { id: item.variantId },
+        data: { reservedQty: { decrement: item.quantity } },
+      });
+    }
+
+    return true;
+  });
+
+  if (expired) {
+    // Stand-in using the existing cancellation template -- consider adding
+    // a dedicated "payment window expired" notification later, since the
+    // messaging should probably differ from a customer-initiated cancel.
+    notificationService.sendOrderCancelled(order, order.user).catch((err) => {
+      logger.error('Failed to send order expired notification', { orderId, err });
+    });
+  }
+
+  return expired;
+}

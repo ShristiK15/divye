@@ -12,8 +12,11 @@ import {
 } from '@divye/database';
 import { env } from '../../config/env';
 import { AppError, ErrorCodes } from '../../utils/app-error';
+import { tryExpireOrder } from '../orders/orders.service';
 import { notificationService } from '../notifications/notification.service';
 import type { CodConfirmDto, RazorpayCreateOrderDto, RazorpayVerifyDto } from './payments.types';
+import { logger } from '../../utils/logger';
+import { alertingService } from '../notifications/alerting.service';
 
 const razorpay = new Razorpay({
   key_id: env.RAZORPAY_KEY_ID,
@@ -38,7 +41,7 @@ function verifyRazorpaySignature(
     .createHmac('sha256', env.RAZORPAY_KEY_SECRET)
     .update(body)
     .digest('hex');
-  return expected === signature;
+  return safeCompareHex(expected, signature);
 }
 
 function verifyWebhookSignature(body: string, signature: string): boolean {
@@ -46,7 +49,25 @@ function verifyWebhookSignature(body: string, signature: string): boolean {
     .createHmac('sha256', env.RAZORPAY_WEBHOOK_SECRET)
     .update(body)
     .digest('hex');
-  return expected === signature;
+  return safeCompareHex(expected, signature);
+}
+
+// Constant-time comparison for hex-encoded HMAC signatures. Plain === on
+// strings short-circuits at the first mismatched character, leaking
+// information about how many leading characters were correct via response
+// timing. crypto.timingSafeEqual avoids that, but throws on length
+// mismatch rather than returning false, so that's checked explicitly —
+// and Buffer.from with invalid hex input (a malformed header) throws too,
+// so the whole thing is wrapped defensively.
+function safeCompareHex(expectedHex: string, receivedHex: string): boolean {
+  try {
+    const expectedBuf = Buffer.from(expectedHex, 'hex');
+    const receivedBuf = Buffer.from(receivedHex, 'hex');
+    if (expectedBuf.length !== receivedBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, receivedBuf);
+  } catch {
+    return false;
+  }
 }
 
 async function fulfillPayment(orderId: string): Promise<void> {
@@ -63,20 +84,37 @@ async function fulfillPayment(orderId: string): Promise<void> {
   const fulfilled = await prisma.$transaction(async (tx) => {
     // Atomic guard: only proceed if payment isn't already PAID.
     // Prevents double-fulfillment when verify() and the webhook race.
+    
+   // Gate on Order.status, not just Payment.status — a late webhook can
+   // arrive after tryExpireOrder already released this order's stock.
+   // Without this, the payment.status guard alone would pass (still
+   // PENDING) and this would revive an EXPIRED order, re-decrementing
+   // stock that's already been returned to inventory.
+   const orderClaim = await tx.order.updateMany({
+     where: { id: orderId, status: OrderStatus.PENDING },
+     data: { status: OrderStatus.CONFIRMED, paymentStatus: PaymentStatus.PAID },
+   });
+
+   if (orderClaim.count === 0) {
+     return false;
+   }
+
+
     const paymentUpdate = await tx.payment.updateMany({
       where: { orderId, status: { not: PaymentStatus.PAID } },
       data: { status: PaymentStatus.PAID },
     });
     if (paymentUpdate.count === 0) {
+     // Order was PENDING but payment was already PAID — shouldn't
+     // normally happen given Payment/Order transition together, but if
+     // it does, roll the order claim back rather than leaving it
+     // CONFIRMED with no matching payment-side confirmation.
+     await tx.order.updateMany({
+       where: { id: orderId, status: OrderStatus.CONFIRMED },
+       data: { status: OrderStatus.PENDING, paymentStatus: PaymentStatus.PENDING },
+     });
       return false;
     }
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        status: OrderStatus.CONFIRMED,
-        paymentStatus: PaymentStatus.PAID,
-      },
-   });
 
     await tx.orderStatusHistory.create({
       data: { orderId, status: OrderStatus.CONFIRMED, note: 'Payment confirmed' },
@@ -87,9 +125,156 @@ async function fulfillPayment(orderId: string): Promise<void> {
    return true;
   });
 
-  if (!fulfilled) return;
+  if (fulfilled) {
+    notificationService.sendOrderConfirmation(order, order.user).catch(() => {});
+    return;
+  }
+  // Fast path didn't apply — check *why* before giving up. If the order
+  // specifically expired (not e.g. already CONFIRMED by a duplicate
+  // webhook, which is a true no-op we should leave untouched), this is a
+  // payment that genuinely succeeded on Razorpay's side after our window
+  // closed. Reject it outright and the customer paid for nothing they can
+  // get — attempt recovery instead.
+  const currentOrder = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!currentOrder || currentOrder.status !== OrderStatus.EXPIRED) return;
+ 
+  const currentPayment = await prisma.payment.findUnique({ where: { orderId } });
+  if (!currentPayment || currentPayment.status === PaymentStatus.PAID) return;
+ 
+  await recoverLatePaymentOnExpiredOrder(order);
+}
 
-  notificationService.sendOrderConfirmation(order, order.user).catch(() => {});
+// Order expired before payment arrived, but the payment succeeded anyway.
+// Try to give the customer their order back; only fall back to refunding
+// if the stock genuinely isn't there anymore.
+async function recoverLatePaymentOnExpiredOrder(
+  order: Prisma.OrderGetPayload<{
+    include: {
+      items: true;
+      user: { select: { id: true; email: true; name: true; phone: true } };
+    };
+  }>
+): Promise<void> {
+  // Attempt to atomically re-reserve stock for every item, same conditional
+  // SQL as placeOrder's original reservation. If any item can't be
+  // re-reserved, undo whatever we did manage to reserve in this same
+  // transaction — partial fulfillment isn't acceptable, it's all or refund.
+  const reserved: { variantId: string; quantity: number }[] = [];
+  let stockAvailable = true;
+
+  await prisma.$transaction(async (tx) => {
+    for (const item of order.items) {
+      const affected = await tx.$executeRaw`
+        UPDATE "ProductVariant"
+        SET "reservedQty" = "reservedQty" + ${item.quantity}
+        WHERE id = ${item.variantId}
+          AND "stockQty" - "reservedQty" >= ${item.quantity}
+      `;
+      if (affected === 0) {
+        stockAvailable = false;
+        break;
+      }
+      reserved.push({ variantId: item.variantId, quantity: item.quantity });
+    }
+
+    if (!stockAvailable) {
+      for (const r of reserved) {
+        await tx.productVariant.update({
+          where: { id: r.variantId },
+          data: { reservedQty: { decrement: r.quantity } },
+        });
+      }
+    }
+  });
+
+  if (stockAvailable) {
+    const recovered = await prisma.$transaction(async (tx) => {
+      const orderClaim = await tx.order.updateMany({
+        where: { id: order.id, status: OrderStatus.EXPIRED },
+        data: { status: OrderStatus.CONFIRMED, paymentStatus: PaymentStatus.PAID },
+      });
+      if (orderClaim.count === 0) return false;
+
+      await tx.payment.updateMany({
+        where: { orderId: order.id, status: { not: PaymentStatus.PAID } },
+        data: { status: PaymentStatus.PAID },
+      });
+
+      await tx.orderStatusHistory.create({
+        data: {
+          orderId: order.id,
+          status: OrderStatus.CONFIRMED,
+          note: 'Late payment received after expiry — stock re-reserved, order confirmed',
+        },
+      });
+
+      await decrementStockForOrder(tx, order);
+      return true;
+    });
+
+    if (recovered) {
+      notificationService.sendOrderConfirmation(order, order.user).catch(() => {});
+    } else {
+      // Order changed underneath us between the re-reserve and this claim
+      // (e.g. admin intervened manually) — release the reservation we
+      // just took rather than leave it orphaned, and stop rather than
+      // guess what should happen next.
+      await prisma.$transaction(async (tx) => {
+        for (const r of reserved) {
+          await tx.productVariant.update({
+            where: { id: r.variantId },
+            data: { reservedQty: { decrement: r.quantity } },
+          });
+        }
+      });
+      logger.error('Late-recovered stock reservation orphaned, released', { orderId: order.id });
+    }
+    return;
+  }
+
+  // Stock is gone — the payment already happened on Razorpay's end, so
+  // rejecting it accomplishes nothing but a support ticket. Accept it,
+  // then refund automatically rather than leaving it for an admin to
+  // notice and manually reconcile.
+  await prisma.$transaction([
+    prisma.payment.updateMany({
+      where: { orderId: order.id, status: { not: PaymentStatus.PAID } },
+      data: { status: PaymentStatus.PAID },
+    }),
+    prisma.order.update({
+      where: { id: order.id },
+      data: { paymentStatus: PaymentStatus.PAID },
+    }),
+    prisma.orderStatusHistory.create({
+      data: {
+        orderId: order.id,
+        status: OrderStatus.EXPIRED,
+        note: 'Late payment received after expiry — stock unavailable, auto-refund initiated',
+      },
+    }),
+  ]);
+
+  try {
+    await paymentsService.initiateRefund(order.id);
+    notificationService.sendOrderCancelled(order, order.user).catch(() => {});
+  } catch (err) {
+    // Payment is PAID, order is EXPIRED, refund did not go through.
+    // This is a stuck-money state that needs a human — log at error level
+    // so it hits your monitoring/alerting, since silent failure here means
+    // a customer paid and got neither goods nor a refund.
+    logger.error('Auto-refund for late payment on expired order failed', {
+      orderId: order.id,
+      err,
+    });
+    alertingService
+      .sendOpsAlert('Auto-refund failed after late payment on expired order', {
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        error: err instanceof Error ? err.message : String(err),
+        action: 'Customer paid but stock was unavailable and refund did not go through — needs manual refund via /refund/:orderId',
+      })
+      .catch(() => {});
+  }
 }
 
 async function releaseReservedStock(orderId: string): Promise<void> {
@@ -103,6 +288,20 @@ async function releaseReservedStock(orderId: string): Promise<void> {
  const released = await prisma.$transaction(async (tx) => {
    // Atomic guard: skip if payment already reached a terminal state
    // (PAID by a concurrent verify(), or already FAILED by a prior call).
+
+   // Same reasoning as fulfillPayment: only a still-PENDING order has an
+   // active reservation to release. If it already expired (or was
+   // cancelled), reservedQty is already 0 for these items — decrementing
+   // again would go negative.
+   const orderClaim = await tx.order.updateMany({
+     where: { id: orderId, status: OrderStatus.PENDING },
+     data: { status: OrderStatus.CANCELLED, paymentStatus: PaymentStatus.FAILED },
+   });
+
+   if (orderClaim.count === 0) {
+     return false;
+   }
+
    const paymentUpdate = await tx.payment.updateMany({
      where: { orderId, status: { notIn: [PaymentStatus.PAID, PaymentStatus.FAILED] } },
      data: { status: PaymentStatus.FAILED },
@@ -112,13 +311,6 @@ async function releaseReservedStock(orderId: string): Promise<void> {
      return false;
    }
 
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        status: OrderStatus.CANCELLED,
-        paymentStatus: PaymentStatus.FAILED,
-      },
-    });
 
     for (const item of order.items) {
       await tx.productVariant.update({
@@ -174,6 +366,13 @@ export const paymentsService = {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
 
+    // Lazy-check backstop: catches a checkout attempt on an order whose
+   // window already passed but the sweep job hasn't reached yet, so the
+   // rejection is immediate rather than waiting up to a minute.
+   if (await tryExpireOrder(order.id)) {
+     throw new AppError('Order has expired, please place a new order', 409, ErrorCodes.CONFLICT);
+   }
+
     if (order.paymentMethod !== PaymentMethod.RAZORPAY) {
       throw new AppError('Order is not a Razorpay order', 400, ErrorCodes.BAD_REQUEST);
     }
@@ -208,7 +407,10 @@ export const paymentsService = {
     if (!order?.payment) {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
-
+    // ...signature verification, payment update, fulfillPayment call — all unchanged.
+    // fulfillPayment now internally handles PENDING (happy path) and EXPIRED
+    // (recovery path) without the caller needing to distinguish them.
+   
     if (order.payment.razorpayOrderId !== dto.razorpay_order_id) {
       throw new AppError('Razorpay order ID mismatch', 400, ErrorCodes.BAD_REQUEST);
     }
@@ -371,6 +573,61 @@ export const paymentsService = {
         });
       });
     }
+
+    if (payload.event === 'refund.failed') {
+      const refundEntity = payload.payload.refund?.entity;
+      if (!refundEntity) return;
+
+      const payment = await prisma.payment.findFirst({
+        where: { razorpayPaymentId: refundEntity.payment_id },
+      });
+    
+      if (!payment) return;
+    
+      // Roll REFUND_PROCESSING back to PAID — the original payment is still
+      // valid and held, the refund attempt itself is what failed. This is
+      // the async counterpart to the synchronous catch-block rollback in
+      // initiateRefund; without this handler, a refund that fails after
+      // Razorpay initially accepted the request leaves the payment stuck at
+      // REFUND_PROCESSING with no path back out.
+      const claim = await prisma.payment.updateMany({
+        where: { orderId: payment.orderId, status: PaymentStatus.REFUND_PROCESSING },
+        data: { status: PaymentStatus.PAID },
+      });
+    
+      if (claim.count === 0) return; // already resolved by another path — nothing to do
+      
+      const order = await prisma.order.findUniqueOrThrow({ where: { id: payment.orderId } });
+
+      await prisma.orderStatusHistory.create({
+        data: {
+          orderId: payment.orderId,
+          status: order.status,
+          note: `Refund attempt failed via Razorpay: ${refundEntity.id} — payment status reverted to PAID, needs manual retry`,
+        },
+      });
+    
+      // This needs a human: the order is cancelled/returned/expired (refund
+      // was already attempted), the customer is expecting money back, and the
+      // automated path just failed. Silent log-only here would mean nobody
+      // notices until the customer complains.
+      logger.error('Razorpay refund failed — needs manual review', {
+        orderId: payment.orderId,
+        refundId: refundEntity.id,
+        paymentId: refundEntity.payment_id,
+      });
+
+      alertingService
+        .sendOpsAlert('Refund failed — customer awaiting money back', {
+          orderId: payment.orderId,
+          orderNumber: order.orderNumber,
+          refundId: refundEntity.id,
+          razorpayPaymentId: refundEntity.payment_id,
+          amount: refundEntity.amount,
+          action: 'Refund must be retried manually via Razorpay dashboard or POST /refund/:orderId',
+        })
+        .catch(() => {}); // sendOpsAlert already self-catches; this is defense in depth
+  }
   },
 
   async confirmCod(dto: CodConfirmDto, userId: string) {
@@ -382,6 +639,11 @@ export const paymentsService = {
     if (!order) {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
+
+    if (await tryExpireOrder(order.id)) {
+      throw new AppError('Order has expired, please place a new order', 409, ErrorCodes.CONFLICT);
+    }
+ 
 
     if (order.paymentMethod !== PaymentMethod.COD) {
       throw new AppError('Order is not a COD order', 400, ErrorCodes.BAD_REQUEST);
@@ -428,9 +690,13 @@ export const paymentsService = {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
 
-    if (order.status !== OrderStatus.CANCELLED && order.status !== OrderStatus.RETURNED) {
+   if (
+     order.status !== OrderStatus.CANCELLED &&
+     order.status !== OrderStatus.RETURNED &&
+     order.status !== OrderStatus.EXPIRED
+   ) {
       throw new AppError(
-        'Order must be cancelled or returned before it can be refunded',
+        'Order must be cancelled, returned, or expired before it can be refunded',
         400,
         ErrorCodes.BAD_REQUEST
       );
