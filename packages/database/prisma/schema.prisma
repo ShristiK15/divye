@@ -149,6 +149,8 @@ model Product {
   description String
   categoryId  String
   brand       String
+  avgRating   Decimal  @default(0) @db.Decimal(2, 1)
+  reviewCount Int      @default(0)
   isActive    Boolean  @default(true)
   isFeatured  Boolean  @default(false)
   createdAt   DateTime @default(now())
@@ -415,6 +417,7 @@ model Review {
 
   user    User    @relation(fields: [userId], references: [id])
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  images  ReviewImage[]
 
   @@unique([userId, productId])
   @@index([productId])
@@ -469,4 +472,16 @@ model HeroImage {
   updatedAt DateTime @updatedAt
 
   @@index([sortOrder])
+}
+
+model ReviewImage {
+  id        String  @id @default(cuid())
+  reviewId  String
+  url       String
+  publicId  String
+  sortOrder Int     @default(0)
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  @@index([reviewId])
 }
