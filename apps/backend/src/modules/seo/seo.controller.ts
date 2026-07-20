@@ -9,7 +9,8 @@ export const getByProductId = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await seoService.getByProductId(req.params.id);
+    const isAdmin = req.user?.role === 'ADMIN';
+    const result = await seoService.getByProductId(req.params.id, isAdmin);
     res.status(200).json(successResponse(result, 'SEO data retrieved'));
   } catch (error) {
     next(error);

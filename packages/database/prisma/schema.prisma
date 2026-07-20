@@ -147,6 +147,7 @@ model Product {
   id          String   @id @default(cuid())
   name        String
   description String
+  slug        String   @unique
   categoryId  String
   brand       String
   avgRating   Decimal  @default(0) @db.Decimal(2, 1)
@@ -168,6 +169,7 @@ model Product {
   @@index([categoryId])
   @@index([brand])
   @@index([createdAt])
+  @@index([slug])
 }
 
 model ProductVariant {
@@ -225,7 +227,6 @@ model ProductSeo {
   productId       String   @unique
   metaTitle       String?
   metaDescription String?
-  slug            String   @unique
   focusKeyword    String?
   keywords        String[]
   ogTitle         String?
@@ -237,8 +238,6 @@ model ProductSeo {
   updatedAt       DateTime @updatedAt
 
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
-
-  @@index([slug])
 }
 
 model InventoryLog {
@@ -313,7 +312,7 @@ model Order {
   id             String        @id @default(cuid())
   orderNumber    String        @unique
   userId         String
-  addressId      String
+  addressId      String?
   status         OrderStatus   @default(PENDING)
   paymentStatus  PaymentStatus @default(PENDING)
   paymentMethod  PaymentMethod
@@ -329,8 +328,16 @@ model Order {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
   expiresAt      DateTime?
+  shippingName    String
+  shippingPhone   String
+  shippingLine1   String
+  shippingLine2   String?
+  shippingCity    String
+  shippingState   String
+  shippingPincode String
+
   user           User                 @relation(fields: [userId], references: [id])
-  address        Address              @relation(fields: [addressId], references: [id])
+  address        Address?             @relation(fields: [addressId], references: [id], onDelete: SetNull)
   items          OrderItem[]
   payment        Payment?
   statusHistory  OrderStatusHistory[]
@@ -452,6 +459,11 @@ model AppSettings {
   codEnabled            Boolean  @default(true)
   codMinOrderValue      Decimal  @db.Decimal(10, 2) @default(0)
   codMaxOrderValue      Decimal? @db.Decimal(10, 2) // null = no upper limit
+  supportPhone          String   @default("")
+  supportWhatsapp       String   @default("")
+  supportEmail          String   @default("")
+  businessAddress       String   @default("")
+  businessHours         String   @default("")
   updatedAt             DateTime @updatedAt
 }
 

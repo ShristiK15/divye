@@ -33,8 +33,33 @@ const heroImages = {
     const maxOrderResult = await prisma.heroImage.aggregate({ _max: { sortOrder: true } });
     const startOrder = (maxOrderResult._max.sortOrder ?? -1) + 1;
 
-    const uploaded = await Promise.all(files.map((file) => uploadBuffer(file.buffer)));
+    // Promise.allSettled rather than Promise.all: if upload 3 of 5 fails,
+    // uploads 1-2 have already landed in Cloudinary. Promise.all would
+    // reject immediately and leave those two orphaned with no DB row and
+    // nothing tracking them for cleanup. We wait for every attempt, and if
+    // any failed, best-effort delete the ones that succeeded before
+    // throwing — same "don't fail the request over Cloudinary, but don't
+    // leak either" spirit as remove()'s cleanup, just on the write path.
+    const settled = await Promise.allSettled(files.map((file) => uploadBuffer(file.buffer)));
 
+    const succeeded = settled.filter(
+      (r): r is PromiseFulfilledResult<{ url: string; publicId: string }> => r.status === 'fulfilled'
+    );
+    const failed = settled.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+
+    if (failed.length > 0) {
+      await Promise.all(
+        succeeded.map((r) => cloudinary.uploader.destroy(r.value.publicId).catch(() => undefined))
+      );
+      throw new AppError(
+        `${failed.length} of ${files.length} image upload(s) failed; none were saved`,
+        502,
+        ErrorCodes.EXTERNAL_SERVICE_ERROR
+      );
+    }
+    
+    const uploaded = succeeded.map((r) => r.value);
+    
     return prisma.$transaction(
       uploaded.map((result, i) =>
         prisma.heroImage.create({

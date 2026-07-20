@@ -21,13 +21,17 @@ export interface CodEligibilityResult {
 
 export const settingsService = {
   async getSettings() {
-    const existing = await prisma.appSettings.findUnique({ where: { id: SETTINGS_ID } });
-    if (existing) return existing;
-
     // Lazily seed on first read so a fresh environment doesn't need a manual
-    // seed step just to make checkout work.
-    return prisma.appSettings.create({
-      data: {
+    // seed step just to make checkout work. Upsert (single INSERT ... ON
+    // CONFLICT) rather than find-then-create: two concurrent first-reads
+    // (e.g. homepage + checkout both hitting getPublicSettings on a cold
+    // start) would otherwise both see no row and race to create one, and
+    // the loser would throw P2002.
+    return prisma.appSettings.upsert({
+      where: { id: SETTINGS_ID },
+      update: {},
+      create: {
+
         id: SETTINGS_ID,
         freeShippingThreshold: DEFAULT_FREE_SHIPPING_THRESHOLD,
         flatShippingCharge: DEFAULT_FLAT_SHIPPING_CHARGE,
@@ -119,6 +123,13 @@ export const settingsService = {
       codMinOrderValue: settings.codMinOrderValue,
       codMaxOrderValue: settings.codMaxOrderValue,
       heroImages,
+      contact: {
+        supportPhone: settings.supportPhone,
+        supportWhatsapp: settings.supportWhatsapp,
+        supportEmail: settings.supportEmail,
+        businessAddress: settings.businessAddress,
+        businessHours: settings.businessHours,
+      },
     };
   },
 };

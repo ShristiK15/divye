@@ -4,6 +4,8 @@ import { AppError, ErrorCodes } from '../../utils/app-error';
 import { settingsService } from './settings.service';
 import { homepageService } from './homepage.service';
 import type { UpdateAppSettingsDto } from './settings.types';
+import { contactService } from './contact.service';
+import type { UpdateContactDetailsDto } from './contact.types';
 import type { ReorderHeroImagesDto, UpdateHeroImageAltDto } from './homepage.types';
 
 export const getSettings = async (
@@ -98,6 +100,19 @@ export const updateHeroImageAlt = async (
   try {
     const heroImages = await homepageService.heroImages.updateAlt(req.params.id, req.body.altText);
     res.status(200).json(successResponse({ heroImages }, 'Hero image updated'));
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const updateContactDetails = async (
+  req: Request<Record<string, never>, unknown, UpdateContactDetailsDto>,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const settings = await contactService.updateDetails(req.body);
+    res.status(200).json(successResponse(settings, 'Contact details updated'));
   } catch (error) {
     next(error);
   }

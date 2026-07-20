@@ -1,12 +1,15 @@
 import { Prisma, prisma } from '@divye/database';
-import { generateSlug, ensureUniqueSlug } from '@divye/shared';
 import { AppError, ErrorCodes } from '../../utils/app-error';
+import { mapPrismaError } from '../../utils/prisma-error';
 import type { UpsertSeoDto } from './seo.types';
 
 export const seoService = {
-  async getByProductId(productId: string) {
+  async getByProductId(productId: string, isAdmin: boolean) {
     const product = await prisma.product.findUnique({ where: { id: productId } });
-    if (!product) {
+    if (!product || (!product.isActive && !isAdmin)) {
+      // 404, not 403, for the inactive+non-admin case — same pattern as
+      // products/categories: don't confirm existence of a deactivated
+      // product to an unauthenticated caller.
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
 
@@ -15,7 +18,7 @@ export const seoService = {
       throw new AppError('SEO data not found', 404, ErrorCodes.NOT_FOUND);
     }
 
-    return seo;
+    return { ...seo, slug: product.slug };
   },
 
   async upsert(productId: string, dto: UpsertSeoDto) {
@@ -24,40 +27,36 @@ export const seoService = {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
 
-    const baseSlug = dto.slug ?? generateSlug(product.name);
-    const slug = await ensureUniqueSlug(baseSlug, async (s) => {
-      const existing = await prisma.productSeo.findUnique({ where: { slug: s } });
-      return existing !== null && existing.productId !== productId;
-    });
+    try {
+      const seo = await prisma.productSeo.upsert({
+        where: { productId },
+        create: {
+          productId,
+          metaTitle: dto.metaTitle ?? product.name,
+          metaDescription: dto.metaDescription ?? product.description.slice(0, 160),
+          focusKeyword: dto.focusKeyword,
+          keywords: dto.keywords ?? [],
+          ogTitle: dto.ogTitle,
+          ogDescription: dto.ogDescription,
+          ogImage: dto.ogImage,
+          canonicalUrl: dto.canonicalUrl,
+          structuredData: (dto.structuredData ?? undefined) as Prisma.InputJsonValue | undefined,
+        },
+        update: {
+          ...dto,
+          structuredData: (dto.structuredData ?? undefined) as Prisma.InputJsonValue | undefined,
+        },
+      });
 
-    const seo = await prisma.productSeo.upsert({
-      where: { productId },
-      create: {
-        productId,
-        slug,
-        metaTitle: dto.metaTitle ?? product.name,
-        metaDescription: dto.metaDescription ?? product.description.slice(0, 160),
-        focusKeyword: dto.focusKeyword,
-        keywords: dto.keywords ?? [],
-        ogTitle: dto.ogTitle,
-        ogDescription: dto.ogDescription,
-        ogImage: dto.ogImage,
-        canonicalUrl: dto.canonicalUrl,
-        structuredData: (dto.structuredData ?? undefined) as Prisma.InputJsonValue | undefined,
-      },
-      update: {
-        ...dto,
-        slug,
-        structuredData: (dto.structuredData ?? undefined) as Prisma.InputJsonValue | undefined,
-      },
-    });
-
-    return seo;
+      return { ...seo, slug: product.slug };
+    } catch (error) {
+      throw mapPrismaError(error);
+    }
   },
 
   async generateSitemap(): Promise<string> {
-    const products = await prisma.productSeo.findMany({
-      where: { product: { isActive: true } },
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
       select: { slug: true, updatedAt: true },
     });
 

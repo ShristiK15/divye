@@ -6,8 +6,8 @@ import {
   Prisma,
   StockMovementType,
 } from '@divye/database';
-import {parseDecimal} from '@divye/shared/utils/decimal';
-import { calculateGstBreakdown} from '@divye/shared';
+import { parseDecimal } from '@divye/shared/utils/decimal';
+import { calculateGstBreakdown } from '@divye/shared';
 import Decimal from 'decimal.js';
 import { AppError, ErrorCodes } from '../../utils/app-error';
 import { buildPaginationMeta } from '../../utils/response';
@@ -36,13 +36,13 @@ const ALLOWED_STATUS_TRANSITIONS: Record<string, string[]> = {
   RETURNED: ['REFUNDED'],
   CANCELLED: ['REFUNDED'],
   REFUNDED: [],
- // EXPIRED is entered by tryExpireOrder (system-driven, not via
- // updateStatus). It's not fully terminal: a late-arriving payment can
- // still recover it back to CONFIRMED if stock is re-available, or move
- // it to REFUNDED if the payment is accepted but stock is gone. Neither
- // transition is applied through updateStatus/this map (they're direct
- // service writes from payments.service's late-recovery flow) — this
- // entry exists for documentation/consistency, not enforcement.
+  // EXPIRED is entered by tryExpireOrder (system-driven, not via
+  // updateStatus). It's not fully terminal: a late-arriving payment can
+  // still recover it back to CONFIRMED if stock is re-available, or move
+  // it to REFUNDED if the payment is accepted but stock is gone. Neither
+  // transition is applied through updateStatus/this map (they're direct
+  // service writes from payments.service's late-recovery flow) — this
+  // entry exists for documentation/consistency, not enforcement.
   EXPIRED: ['CONFIRMED', 'REFUNDED'],
 };
 
@@ -227,6 +227,13 @@ export const ordersService = {
           totalAmount: toDecimal(totalAmount.toString()),
           couponCode: dto.couponCode,
           notes: dto.notes,
+          shippingName: address.name,
+          shippingPhone: address.phone,
+          shippingLine1: address.line1,
+          shippingLine2: address.line2,
+          shippingCity: address.city,
+          shippingState: address.state,
+          shippingPincode: address.pincode,
           status: OrderStatus.PENDING,
           paymentStatus: PaymentStatus.PENDING,
           expiresAt: new Date(Date.now() + ORDER_PENDING_TIMEOUT_MINUTES * 60 * 1000),
@@ -320,19 +327,19 @@ export const ordersService = {
       throw new AppError('Order not found', 404, ErrorCodes.NOT_FOUND);
     }
 
-   // Lazy-check backstop: if this PENDING order's payment window already
-   // passed but the sweep job hasn't reached it yet, expire it now rather
-   // than falling through to the generic "cannot be cancelled" rejection
-   // below (EXPIRED isn't in the PENDING/CONFIRMED check) — gives the
-   // customer an accurate reason instead of a confusing dead end, and
-   // ensures it's correctly logged as EXPIRED, not left silently stuck.
-   if (await tryExpireOrder(order.id)) {
-     throw new AppError(
-       'This order has expired as payment was not completed in time',
-       409,
-       ErrorCodes.CONFLICT
-     );
-   }
+    // Lazy-check backstop: if this PENDING order's payment window already
+    // passed but the sweep job hasn't reached it yet, expire it now rather
+    // than falling through to the generic "cannot be cancelled" rejection
+    // below (EXPIRED isn't in the PENDING/CONFIRMED check) — gives the
+    // customer an accurate reason instead of a confusing dead end, and
+    // ensures it's correctly logged as EXPIRED, not left silently stuck.
+    if (await tryExpireOrder(order.id)) {
+      throw new AppError(
+        'This order has expired as payment was not completed in time',
+        409,
+        ErrorCodes.CONFLICT
+      );
+    }
 
     if (order.status !== OrderStatus.PENDING && order.status !== OrderStatus.CONFIRMED) {
       throw new AppError('Order cannot be cancelled at this stage', 400, ErrorCodes.BAD_REQUEST);
@@ -345,36 +352,39 @@ export const ordersService = {
 
     await prisma.$transaction(async (tx) => {
       // Idempotency guard against a duplicate/double-submitted cancel request.
-    const orderUpdate = await tx.order.updateMany({
-      where: { id: orderId, status: order.status },
-      data: {
-        status: OrderStatus.CANCELLED,
-        // No refund has actually happened yet — don't fabricate REFUNDED.
-        // A PAID order stays PAID (= "refund owed") until an admin
-        // explicitly calls POST /refund/:orderId.
-        paymentStatus:
-          order.paymentStatus === PaymentStatus.PAID
-            ? PaymentStatus.PAID
-            : PaymentStatus.FAILED,
-      },
-    });
-    if (orderUpdate.count === 0) {
-      throw new AppError('Order was already updated, please retry', 409, ErrorCodes.CONFLICT);
-    }
+      const orderUpdate = await tx.order.updateMany({
+        where: { id: orderId, status: order.status },
+        data: {
+          status: OrderStatus.CANCELLED,
+          // No refund has actually happened yet — don't fabricate REFUNDED.
+          // A PAID order stays PAID (= "refund owed") until an admin
+          // explicitly calls POST /refund/:orderId.
+          paymentStatus:
+            order.paymentStatus === PaymentStatus.PAID
+              ? PaymentStatus.PAID
+              : PaymentStatus.FAILED,
+        },
+      });
+      if (orderUpdate.count === 0) {
+        throw new AppError('Order was already updated, please retry', 409, ErrorCodes.CONFLICT);
+      }
       await tx.orderStatusHistory.create({
         data: { orderId, status: OrderStatus.CANCELLED, note: 'Cancelled by customer' },
       });
 
-    if (stockAlreadySold) {
-          await restoreStockForOrder(tx, order);
-        } else {
-          for (const item of order.items) {
-            await tx.productVariant.update({
-              where: { id: item.variantId },
-              data: { reservedQty: { decrement: item.quantity } },
-            });
-          }
+      if (stockAlreadySold) {
+        await restoreStockForOrder(tx, order);
+      } else {
+        for (const item of order.items) {
+          await tx.productVariant.update({
+            where: { id: item.variantId },
+            data: { reservedQty: { decrement: item.quantity } },
+          });
         }
+      }
+      if (dto.status === OrderStatus.RETURNED) {
+        await restoreStockForOrder(tx, order);
+      }
     });
 
     notificationService.sendOrderCancelled(order, order.user).catch((err) => {
@@ -395,15 +405,22 @@ export const ordersService = {
       throw new AppError('Return can only be requested for delivered orders', 400, ErrorCodes.BAD_REQUEST);
     }
 
-    await prisma.$transaction([
-      prisma.order.update({
-        where: { id: orderId },
+    await prisma.$transaction(async (tx) => {
+      const orderUpdate = await tx.order.updateMany({
+        where: { id: orderId, status: OrderStatus.DELIVERED },
         data: { status: OrderStatus.RETURN_REQUESTED },
-      }),
-      prisma.orderStatusHistory.create({
+      });
+      if (orderUpdate.count === 0) {
+        throw new AppError(
+          'Order status changed concurrently, please refresh and retry',
+          409,
+          ErrorCodes.CONFLICT
+        );
+      }
+      await tx.orderStatusHistory.create({
         data: { orderId, status: OrderStatus.RETURN_REQUESTED, note: 'Return requested by customer' },
-      }),
-    ]);
+      });
+    });
   },
 
   async getAdminOrders(query: AdminOrdersQuery) {
@@ -414,11 +431,11 @@ export const ordersService = {
       ...(status && { status }),
       ...(from || to
         ? {
-            createdAt: {
-              ...(from && { gte: from }),
-              ...(to && { lte: to }),
-            },
-          }
+          createdAt: {
+            ...(from && { gte: from }),
+            ...(to && { lte: to }),
+          },
+        }
         : {}),
     };
 
@@ -478,57 +495,63 @@ export const ordersService = {
     const stockAlreadySold = order.status !== OrderStatus.PENDING;
 
     await prisma.$transaction(async (tx) => {
-    // Atomic guard: only apply if the order is still in the exact status
-    // we validated the transition against. If it's moved on (a concurrent
-    // admin action, or this same request retried/double-submitted), the
-    // transition we approved is now stale — reject rather than overwrite
-    // whatever the other write did.
-    const orderUpdate = await tx.order.updateMany({
-      where: { id: orderId, status: order.status },
-      data: {
-        status: dto.status,
-        ...(dto.status === OrderStatus.CANCELLED && {
-          paymentStatus:
-            order.paymentStatus === PaymentStatus.PAID
-              ? PaymentStatus.PAID
-              : PaymentStatus.FAILED,
-        }),
-        ...(dto.trackingId && { trackingId: dto.trackingId }),
-        ...(dto.carrierId && { carrierId: dto.carrierId }),
-      },
-    });
-    if (orderUpdate.count === 0) {
-      throw new AppError(
-        'Order status changed concurrently, please refresh and retry',
-        409,
-        ErrorCodes.CONFLICT
-      );
-    }
+      // Atomic guard: only apply if the order is still in the exact status
+      // we validated the transition against. If it's moved on (a concurrent
+      // admin action, or this same request retried/double-submitted), the
+      // transition we approved is now stale — reject rather than overwrite
+      // whatever the other write did.
+      const orderUpdate = await tx.order.updateMany({
+        where: { id: orderId, status: order.status },
+        data: {
+          status: dto.status,
+          ...(dto.status === OrderStatus.CANCELLED && {
+            paymentStatus:
+              order.paymentStatus === PaymentStatus.PAID
+                ? PaymentStatus.PAID
+                : PaymentStatus.FAILED,
+          }),
+          ...(dto.trackingId && { trackingId: dto.trackingId }),
+          ...(dto.carrierId && { carrierId: dto.carrierId }),
+        },
+      });
+      if (orderUpdate.count === 0) {
+        throw new AppError(
+          'Order status changed concurrently, please refresh and retry',
+          409,
+          ErrorCodes.CONFLICT
+        );
+      }
 
       await tx.orderStatusHistory.create({
         data: { orderId, status: dto.status, note: dto.note },
       });
-      
-      // PENDING orders only ever had stock reserved; CONFIRMED/PROCESSING
-      // orders already had it sold at confirm time and need restoring
-      // instead of a reservedQty release (see cancelOrder for the same
-      // distinction).
-      if (stockAlreadySold) {
-        await restoreStockForOrder(tx, order);
-      } else {
-        for (const item of order.items) {
-          await tx.productVariant.update({
-            where: { id: item.variantId },
-            data: { reservedQty: { decrement: item.quantity } },
-          });
+      // Stock is only touched on transitions that actually release or
+      // restore it: CANCELLED (releases whatever hold the order had —
+      // reservation or sale) and RETURNED (restores stock sold at
+      // delivery). Every other transition (CONFIRMED, PROCESSING, SHIPPED,
+      // OUT_FOR_DELIVERY, DELIVERED, RETURN_REQUESTED) is pure fulfillment
+      // progress and must never mutate stock.
+      if (dto.status === OrderStatus.CANCELLED) {
+        // PENDING orders only ever had stock reserved; CONFIRMED/PROCESSING
+        // orders already had it sold at confirm time and need restoring
+        // instead of a reservedQty release (see cancelOrder for the same
+        // distinction).
+        if (stockAlreadySold) {
+          await restoreStockForOrder(tx, order);
+        } else {
+          for (const item of order.items) {
+            await tx.productVariant.update({
+              where: { id: item.variantId },
+              data: { reservedQty: { decrement: item.quantity } },
+            });
+          }
         }
+      } else if (dto.status === OrderStatus.RETURNED) {
+        // RETURN_REQUESTED -> RETURNED is only reachable from DELIVERED,
+        // which always means stock was already sold (never just reserved).
+        await restoreStockForOrder(tx, order);
       }
-     // RETURN_REQUESTED -> RETURNED is only reachable from DELIVERED, which
-     // always means stock was already sold (never just reserved) — no
-     // PENDING branch needed here, unlike CANCELLED which can happen pre-sale.
-     if (dto.status === OrderStatus.RETURNED) {
-       await restoreStockForOrder(tx, order);
-     }
+
     });
 
     if (dto.status === OrderStatus.SHIPPED && dto.trackingId) {

@@ -5,6 +5,7 @@ import { uploadMultiple } from '../../middleware/upload.middleware';
 import * as settingsController from './settings.controller';
 import { updateAppSettingsSchema } from './settings.types';
 import { heroImageOrderSchema, updateHeroImageAltSchema } from './homepage.types';
+import { updateContactDetailsSchema } from './contact.types';
 
 // Mount at /api/admin/settings. Full settings row, admin-only, read/write.
 export const adminSettingsRouter = Router();
@@ -50,7 +51,13 @@ adminSettingsRouter.patch(
   validate(updateHeroImageAltSchema),
   settingsController.updateHeroImageAlt
 );
-
+adminSettingsRouter.put(
+  '/contact',
+  authenticate,
+  requireAdmin,
+  validate(updateContactDetailsSchema),
+  settingsController.updateContactDetails
+);
 // Mount at /api/settings. No auth — the storefront checkout page needs this
 // before an order is placed (e.g. to show/hide the COD option and the
 // free-shipping threshold), and the homepage needs it to render the hero

@@ -2,6 +2,7 @@ import { Prisma, prisma } from '@divye/database';
 import { generateSlug, ensureUniqueSlug } from '@divye/shared';
 import { cloudinary } from '../../config/cloudinary';
 import { AppError, ErrorCodes } from '../../utils/app-error';
+import { mapPrismaError } from '../../utils/prisma-error';
 import { buildPaginationMeta } from '../../utils/response';
 import { toDecimal } from '../../utils/decimal';
 import { getAvailableQty } from '../../utils/decimal';
@@ -24,8 +25,9 @@ function mapListItem(product: {
   id: string;
   name: string;
   brand: string;
-  isActive: boolean;  
+  isActive: boolean;
   isFeatured: boolean;
+  slug: string;
   category: { id: string; name: string; slug: string };
   images: Array<{ url: string; isPrimary: boolean }>;
   variants: Array<{
@@ -37,7 +39,6 @@ function mapListItem(product: {
     stockQty: number;
     reservedQty: number;
   }>;
-  seo: { slug: string } | null;
 }): ProductListItem {
   const primaryVariant = product.variants[0];
   const primaryImage = product.images.find((i) => i.isPrimary) ?? product.images[0];
@@ -48,18 +49,18 @@ function mapListItem(product: {
     brand: product.brand,
     isActive: product.isActive,
     isFeatured: product.isFeatured,
-    slug: product.seo?.slug ?? null,
+    slug: product.slug,
     primaryImage: primaryImage?.url ?? null,
     category: product.category,
     variant: primaryVariant
       ? {
-          id: primaryVariant.id,
-          sku: primaryVariant.sku,
-          price: primaryVariant.price.toString(),
-          mrp: primaryVariant.mrp.toString(),
-          gstPercent: primaryVariant.gstPercent.toString(),
-          stockQty: getAvailableQty(primaryVariant.stockQty, primaryVariant.reservedQty),
-        }
+        id: primaryVariant.id,
+        sku: primaryVariant.sku,
+        price: primaryVariant.price.toString(),
+        mrp: primaryVariant.mrp.toString(),
+        gstPercent: primaryVariant.gstPercent.toString(),
+        stockQty: getAvailableQty(primaryVariant.stockQty, primaryVariant.reservedQty),
+      }
       : null,
   };
 }
@@ -118,7 +119,6 @@ export const productsService = {
             orderBy: { price: sort === 'price_asc' ? 'asc' : sort === 'price_desc' ? 'desc' : 'asc' },
             take: 1,
           },
-          seo: { select: { slug: true } },
         },
         skip,
         take: limit,
@@ -149,23 +149,18 @@ export const productsService = {
       },
     };
 
-    const product = await prisma.product.findUnique({ where: { id: identifier }, include });
-    if (product) {
-      if (!isAdmin && !product.isActive) {
-        throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
-      }
-      return product; 
-    }
-
-    const slugProduct = await prisma.product.findFirst({
-      where: { seo: { slug: identifier }, ...(isAdmin ? {} : { isActive: true }) },
+    const product = await prisma.product.findFirst({
+      where: {
+        OR: [{ id: identifier }, { slug: identifier }],
+        ...(isAdmin ? {} : { isActive: true }),
+      },
       include,
     });
 
-    if (!slugProduct) {
+    if (!product) {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
-    return slugProduct;
+    return product;
   },
 
   async getBySlug(slug: string, isAdmin = false) {
@@ -177,7 +172,7 @@ export const productsService = {
     if (!category || !category.isActive) {
       throw new AppError('Category not found', 404, ErrorCodes.NOT_FOUND);
     }
-  
+
     return this.list({ ...query, category: slug }, isAdmin);
   },
 
@@ -198,61 +193,76 @@ export const productsService = {
       throw new AppError('Category not found', 404, ErrorCodes.NOT_FOUND);
     }
 
-    const baseSlug = generateSlug(dto.name);
+    const baseSlug = dto.slug ? generateSlug(dto.slug) : generateSlug(dto.name);
     const slug = await ensureUniqueSlug(baseSlug, async (s) => {
-      const existing = await prisma.productSeo.findUnique({ where: { slug: s } });
+      const existing = await prisma.product.findUnique({ where: { slug: s } });
       return existing !== null;
     });
 
-    const product = await prisma.product.create({
-      data: {
-        name: dto.name,
-        description: dto.description,
-        categoryId: dto.categoryId,
-        brand: dto.brand,
-        isActive: dto.isActive ?? true,
-        isFeatured: dto.isFeatured,
-        variants: {
-          create: dto.variants.map((v) => ({
-            sku: v.sku,
-            name: v.name,
-            price: toDecimal(v.price),
-            mrp: toDecimal(v.mrp),
-            gstPercent: toDecimal(v.gstPercent),
-            hsnCode: v.hsnCode,
-            stockQty: v.stockQty,
-            lowStockThreshold: v.lowStockThreshold,
-            supplierId: v.supplierId,
-            attributes: v.attributes,
-          })),
-        },
-        specifications: dto.specifications
-          ? { create: dto.specifications }
-          : undefined,
-        seo: {
-          create: {
-            slug,
-            metaTitle: dto.seo?.metaTitle ?? dto.name,
-            metaDescription: dto.seo?.metaDescription ?? dto.description.slice(0, 160),
-            focusKeyword: dto.seo?.focusKeyword ?? null,
-            keywords: dto.seo?.keywords ?? [],
-            ogTitle: dto.seo?.ogTitle ?? null,
-            ogDescription: dto.seo?.ogDescription ?? null,
-            ogImage: dto.seo?.ogImage ?? null,
+    try {
+      return await prisma.product.create({
+        data: {
+          name: dto.name,
+          slug,
+          description: dto.description,
+          categoryId: dto.categoryId,
+          brand: dto.brand,
+          isActive: dto.isActive ?? true,
+          isFeatured: dto.isFeatured,
+          variants: {
+            create: dto.variants.map((v) => ({
+              sku: v.sku,
+              name: v.name,
+              price: toDecimal(v.price),
+              mrp: toDecimal(v.mrp),
+              gstPercent: toDecimal(v.gstPercent),
+              hsnCode: v.hsnCode,
+              stockQty: v.stockQty,
+              lowStockThreshold: v.lowStockThreshold,
+              supplierId: v.supplierId,
+              attributes: v.attributes,
+            })),
+          },
+          specifications: dto.specifications ? { create: dto.specifications } : undefined,
+          seo: {
+            create: {
+              metaTitle: dto.seo?.metaTitle ?? dto.name,
+              metaDescription: dto.seo?.metaDescription ?? dto.description.slice(0, 160),
+              focusKeyword: dto.seo?.focusKeyword ?? null,
+              keywords: dto.seo?.keywords ?? [],
+              ogTitle: dto.seo?.ogTitle ?? null,
+              ogDescription: dto.seo?.ogDescription ?? null,
+              ogImage: dto.seo?.ogImage ?? null,
+            },
           },
         },
-      },
-      include: productInclude,
-    });
+        include: productInclude,
+      });
+    } catch (error) {
+      throw mapPrismaError(error);
+    }
 
-    return product;
   },
 
   async update(id: string, dto: UpdateProductDto) {
-    const existing = await prisma.product.findUnique({ where: { id }, include: { seo: true } });
+    const existing = await prisma.product.findUnique({ where: { id } });
     if (!existing) {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
+
+    // Slug stays stable across name changes by default — only regenerate when
+    // the admin explicitly supplies a new one. Renaming a product shouldn't
+    // silently break every link/bookmark/indexed URL pointing at its old slug.
+    let slugUpdate: { slug: string } | Record<string, never> = {};
+    if (dto.slug !== undefined) {
+      const baseSlug = generateSlug(dto.slug);
+      const finalSlug = await ensureUniqueSlug(baseSlug, async (s) => {
+        const clash = await prisma.product.findUnique({ where: { slug: s } });
+        return clash !== null && clash.id !== id;
+      });
+      slugUpdate = { slug: finalSlug };
+    }
+
 
     const productData = {
       ...(dto.name !== undefined && { name: dto.name }),
@@ -261,110 +271,106 @@ export const productsService = {
       ...(dto.brand !== undefined && { brand: dto.brand }),
       ...(dto.isFeatured !== undefined && { isFeatured: dto.isFeatured }),
       ...(dto.isActive !== undefined && { isActive: dto.isActive }),
+      ...slugUpdate
     };
 
-    const seoSlug = dto.seo?.slug ?? existing.seo?.slug ?? generateSlug(existing.name);
-    const finalSlug = await ensureUniqueSlug(seoSlug, async (s) => {
-      const existingSeo = await prisma.productSeo.findUnique({ where: { slug: s } });
-      return existingSeo !== null && existingSeo.productId !== id;
-    });
-
-    const product = await prisma.$transaction(async (tx) => {
-      const updatedProduct = await tx.product.update({
-        where: { id },
-        data: productData,
-      });
-
-      if (dto.variants !== undefined) {
-        const incomingIds = dto.variants
-          .map((v) => v.id)
-          .filter((id): id is string => Boolean(id));
-      
-        // Delete variants that were removed from the payload (not present by id)
-        await tx.productVariant.deleteMany({
-          where: {
-            productId: updatedProduct.id,
-            id: { notIn: incomingIds },
-          },
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const updatedProduct = await tx.product.update({
+          where: { id },
+          data: productData,
         });
-      
-        for (const v of dto.variants) {
-          const data = {
-            sku: v.sku,
-            name: v.name,
-            price: toDecimal(v.price),
-            mrp: toDecimal(v.mrp),
-            gstPercent: toDecimal(v.gstPercent),
-            hsnCode: v.hsnCode,
-            stockQty: v.stockQty,
-            lowStockThreshold: v.lowStockThreshold,
-            supplierId: v.supplierId,
-            attributes: v.attributes,
-          };
-        
-          if (v.id) {
-            // Scope the update to this product so one product's payload can't
-            // silently touch another product's variant by guessing/reusing an id
-            const result = await tx.productVariant.updateMany({
-              where: { id: v.id, productId: updatedProduct.id },
-              data,
-            });
-          
-            if (result.count === 0) {
-              throw new AppError(
-                `Variant ${v.id} not found for this product`,
-                404,
-                ErrorCodes.NOT_FOUND
-              );
-            }
-    } else {
-      await tx.productVariant.create({
-        data: { ...data, productId: updatedProduct.id },
-      });
-    }
-  }
-}
 
-      if (dto.specifications !== undefined) {
-        await tx.productSpec.deleteMany({ where: { productId: updatedProduct.id } });
-        if (dto.specifications.length > 0) {
-          await tx.productSpec.createMany({
-            data: dto.specifications.map((spec) => ({
+        if (dto.variants !== undefined) {
+          const incomingIds = dto.variants
+            .map((v) => v.id)
+            .filter((id): id is string => Boolean(id));
+
+          // Delete variants that were removed from the payload (not present by id)
+          await tx.productVariant.deleteMany({
+            where: {
               productId: updatedProduct.id,
-              key: spec.key,
-              value: spec.value,
-              sortOrder: spec.sortOrder,
-            })),
+              id: { notIn: incomingIds },
+            },
+          });
+
+          for (const v of dto.variants) {
+            const data = {
+              sku: v.sku,
+              name: v.name,
+              price: toDecimal(v.price),
+              mrp: toDecimal(v.mrp),
+              gstPercent: toDecimal(v.gstPercent),
+              hsnCode: v.hsnCode,
+              stockQty: v.stockQty,
+              lowStockThreshold: v.lowStockThreshold,
+              supplierId: v.supplierId,
+              attributes: v.attributes,
+            };
+
+            if (v.id) {
+              // Scope the update to this product so one product's payload can't
+              // silently touch another product's variant by guessing/reusing an id
+              const result = await tx.productVariant.updateMany({
+                where: { id: v.id, productId: updatedProduct.id },
+                data,
+              });
+
+              if (result.count === 0) {
+                throw new AppError(
+                  `Variant ${v.id} not found for this product`,
+                  404,
+                  ErrorCodes.NOT_FOUND
+                );
+              }
+            } else {
+              await tx.productVariant.create({
+                data: { ...data, productId: updatedProduct.id },
+              });
+            }
+          }
+        }
+
+        if (dto.specifications !== undefined) {
+          await tx.productSpec.deleteMany({ where: { productId: updatedProduct.id } });
+          if (dto.specifications.length > 0) {
+            await tx.productSpec.createMany({
+              data: dto.specifications.map((spec) => ({
+                productId: updatedProduct.id,
+                key: spec.key,
+                value: spec.value,
+                sortOrder: spec.sortOrder,
+              })),
+            });
+          }
+        }
+
+        if (dto.seo !== undefined) {
+          const seoData = {
+            metaTitle: dto.seo.metaTitle ?? null,
+            metaDescription: dto.seo.metaDescription ?? null,
+            focusKeyword: dto.seo.focusKeyword ?? null,
+            keywords: dto.seo.keywords ?? [],
+            ogTitle: dto.seo.ogTitle ?? null,
+            ogDescription: dto.seo.ogDescription ?? null,
+            ogImage: dto.seo.ogImage ?? null,
+          };
+
+          await tx.productSeo.upsert({
+            where: { productId: id },
+            create: { productId: id, ...seoData },
+            update: seoData,
           });
         }
-      }
 
-      if (dto.seo !== undefined) {
-        const seoData = {
-          metaTitle: dto.seo.metaTitle ?? null,
-          metaDescription: dto.seo.metaDescription ?? null,
-          slug: finalSlug,
-          focusKeyword: dto.seo.focusKeyword ?? null,
-          keywords: dto.seo.keywords ?? [],
-          ogTitle: dto.seo.ogTitle ?? null,
-          ogDescription: dto.seo.ogDescription ?? null,
-          ogImage: dto.seo.ogImage ?? null,
-        };
-
-        if (existing.seo) {
-          await tx.productSeo.update({ where: { productId: id }, data: seoData });
-        } else {
-          await tx.productSeo.create({ data: { productId: id, ...seoData } });
-        }
-      }
-
-      return tx.product.findUniqueOrThrow({
-        where: { id },
-        include: productInclude,
+        return tx.product.findUniqueOrThrow({
+          where: { id },
+          include: productInclude,
+        });
       });
-    });
-
-    return product;
+    } catch (error) {
+      throw mapPrismaError(error);
+    }
   },
 
   async softDelete(id: string): Promise<void> {
@@ -384,9 +390,9 @@ export const productsService = {
     if (!product) {
       throw new AppError('Product not found', 404, ErrorCodes.NOT_FOUND);
     }
-  
+
     const existingCount = await prisma.productImage.count({ where: { productId } });
-  
+
     const uploadResults = await Promise.all(
       files.map((file) =>
         new Promise<{ secure_url: string; public_id: string }>((resolve, reject) => {
@@ -401,7 +407,7 @@ export const productsService = {
         })
       )
     );
-  
+
     const uploaded = await prisma.productImage.createMany({
       data: uploadResults.map((result, i) => ({
         productId,
@@ -412,7 +418,7 @@ export const productsService = {
         isPrimary: existingCount === 0 && i === 0,
       })),
     });
-  
+
     // createMany doesn't return the created rows — refetch if the caller needs full image records
     return prisma.productImage.findMany({
       where: { productId },
@@ -426,16 +432,16 @@ export const productsService = {
     const image = await prisma.productImage.findFirst({
       where: { id: imageId, productId },
     });
-  
+
     if (!image) {
       throw new AppError('Image not found', 404, ErrorCodes.NOT_FOUND);
     }
-  
+
     // Delete the DB row first — if this fails, we haven't destroyed anything real yet.
     // If Cloudinary delete fails after, we're left with an orphaned remote asset
     // instead of a broken image reference the storefront would actually render — the safer failure direction.
     await prisma.productImage.delete({ where: { id: imageId } });
-  
+
     try {
       await cloudinary.uploader.destroy(image.publicId, { resource_type: 'image' });
     } catch (error) {

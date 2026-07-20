@@ -92,7 +92,7 @@ export const removeImage = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    await reviewsService.removeImage(req.params.id, req.params.imageId, req.user!.id, req.user!.isAdmin);
+    await reviewsService.removeImage(req.params.id, req.params.imageId, req.user!.id, req.user!.role === 'ADMIN');
     res.status(200).json(successResponse(null, 'Image removed'));
   } catch (error) {
     next(error);

@@ -23,7 +23,6 @@ const specSchema = z.object({
 const seoSchema = z.object({
   metaTitle: z.string().max(60).optional(),
   metaDescription: z.string().max(160).optional(),
-  slug: z.string().min(1).optional(),
   focusKeyword: z.string().optional(),
   keywords: z.array(z.string()).default([]),
   ogTitle: z.string().optional(),
@@ -36,6 +35,7 @@ export const createProductSchema = z.object({
   description: z.string().min(10),
   categoryId: z.string().cuid(),
   brand: z.string().min(1),
+  slug: z.string().min(1).optional(),
   isActive: z.boolean().optional().default(true),
   isFeatured: z.boolean().default(false),
   variants: z.array(variantSchema).min(1),
@@ -48,6 +48,7 @@ export const updateProductSchema = z.object({
   description: z.string().min(10).optional(),
   categoryId: z.string().cuid().optional(),
   brand: z.string().min(1).optional(),
+  slug: z.string().min(1).optional(),
   isFeatured: z.boolean().optional(),
   isActive: z.boolean().optional(),
   variants: z.array(variantSchema).min(1).optional(),
@@ -89,7 +90,7 @@ export type ProductListItem = {
   brand: string;
   isActive: boolean;
   isFeatured: boolean;
-  slug: string | null;
+  slug: string;
   primaryImage: string | null;
   category: { id: string; name: string; slug: string };
   variant: ProductListVariant | null;
